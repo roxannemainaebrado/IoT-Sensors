@@ -16,7 +16,7 @@ static const char* DEVICE_KEY   = "php-s-03-ee1ff4f1cd060acffb5b19b40dc2a1fe7be4
 static const uint32_t DOWNTIME_THRESHOLD_MS    = 10000; // 10 seconds
 static const uint32_t STATUS_PRINT_INTERVAL_MS = 2000;  // Print status every 2s
 static const uint32_t DEBOUNCE_MS              = 50;    // 50ms PC817 edge debounce
-static const uint32_t HEARTBEAT_INTERVAL_MS    = 10000; // Backend heartbeat every 10s
+static const uint32_t BACKEND_HEARTBEAT_INTERVAL_MS = 10000; // Backend heartbeat every 10s
 
 // ── State Variables ─────────────────────────────────────────────────────────
 static int      currentState       = HIGH;   // Current debounced GPIO reading
@@ -89,17 +89,17 @@ bool postToBackend(const char* path, const String& jsonBody) {
 
 void sendSensorEvent(const char* eventType, const char* signal, const char* holdReason = nullptr) {
     String meta = String("{\"rssi\":") + String(WiFi.RSSI()) +
-                  ",\"sensorState\"😕"" + sensorStateLabel(currentState) + "\"";
+                  ",\"sensorState\":\"" + sensorStateLabel(currentState) + "\"";
     if (holdReason != nullptr) {
-        meta += String(",\"reason\"😕"") + holdReason + "\"";
+        meta += String(",\"reason\":\"") + holdReason + "\"";
     }
     meta += "}";
 
     String body = String("{") +
-        "\"eventId\"😕"" + generateUuidV4() + "\"," +
-        "\"eventType\"😕"" + eventType + "\"," +
-        "\"signal\"😕"" + signal + "\"," +
-        "\"recordedAt\"😕"" + isoNow() + "\"," +
+        "\"eventId\":\"" + generateUuidV4() + "\"," +
+        "\"eventType\":\"" + eventType + "\"," +
+        "\"signal\":\"" + signal + "\"," +
+        "\"recordedAt\":\"" + isoNow() + "\"," +
         "\"metadata\":" + meta +
     "}";
     postToBackend("/api/iot/events", body);
@@ -108,11 +108,11 @@ void sendSensorEvent(const char* eventType, const char* signal, const char* hold
 void sendHeartbeat() {
     hbSequence++;
     String body = String("{") +
-        "\"heartbeatId\"😕"" + generateUuidV4() + "\"," +
-        "\"bootId\"😕"" + bootId + "\"," +
-        "\"bootCounter\"😕"" + String(bootCounter) + "\"," +
-        "\"sequence\"😕"" + String((unsigned long)hbSequence) + "\"," +
-        "\"recordedAt\"😕"" + isoNow() + "\"," +
+        "\"heartbeatId\":\"" + generateUuidV4() + "\"," +
+        "\"bootId\":\"" + bootId + "\"," +
+        "\"bootCounter\":\"" + String(bootCounter) + "\"," +
+        "\"sequence\":\"" + String((unsigned long)hbSequence) + "\"," +
+        "\"recordedAt\":\"" + isoNow() + "\"," +
         "\"activityObserved\":" + (activitySinceHb ? "true" : "false") +
     "}";
     if (postToBackend("/api/iot/heartbeats", body)) {
@@ -266,7 +266,7 @@ void loop() {
     }
 
     // ── 4. Periodic Backend Heartbeat (every 10s) ───────────────────────────
-    if (now - lastHeartbeatSent >= HEARTBEAT_INTERVAL_MS) {
+    if (now - lastHeartbeatSent >= BACKEND_HEARTBEAT_INTERVAL_MS) {
         lastHeartbeatSent = now;
         sendHeartbeat();
     }
