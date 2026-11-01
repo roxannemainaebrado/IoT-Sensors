@@ -3,41 +3,58 @@
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <time.h>
-#include "config.h"
 
-// ── Network & Backend Configuration ─────────────────────────────────────────
-static const char* WIFI_SSID    = "Realme 11 280";
-static const char* WIFI_PASS    = "12345678900987654321";
-static const char* API_BASE_URL = "http://10.72.136.174:3000";
+// =============================================================================
+// ESP32 SENSOR 3 — MACHINE MAIN SENSOR (SPINDLE ROTATION MONITOR)
+// =============================================================================
+// Node ID   : S-03
+// Purpose   : Monitor continuous spindle/shaft rotation via inductive proximity sensor.
+//             - Rotating (signal toggles): transmits throttled activity pulses.
+//             - Stopped (constant LOW or constant HIGH): stops emitting pulses.
+//             - Backend absence watchdog evaluates silence and triggers downtime.
+// =============================================================================
+
+// ── 1. Node Identity & Backend Configuration ────────────────────────────────
+static const char* NODE_ID      = "S-03";
 static const char* DEVICE_ID    = "esp32-m01-s03";
 static const char* DEVICE_KEY   = "php-s-03-ee1ff4f1cd060acffb5b19b40dc2a1fe7be4";
+static const char* API_BASE_URL = "http://10.72.136.174:3000";
 
-// ── Test Configuration ──────────────────────────────────────────────────────
-static const uint32_t DOWNTIME_THRESHOLD_MS    = 10000; // 10 seconds
-static const uint32_t STATUS_PRINT_INTERVAL_MS = 2000;  // Print status every 2s
-static const uint32_t DEBOUNCE_MS              = 50;    // 50ms PC817 edge debounce
-static const uint32_t HEARTBEAT_INTERVAL_MS    = 10000; // Backend heartbeat every 10s
+// ── 2. Network Configuration ────────────────────────────────────────────────
+static const char* WIFI_SSID    = "Realme 11 280";
+static const char* WIFI_PASS    = "12345678900987654321";
 
-// ── State Variables ─────────────────────────────────────────────────────────
-static int      currentState       = HIGH;   // Current debounced GPIO reading
-static int      previousState      = HIGH;   // Previous reading (for edge detection)
-static int      lastRawReading     = HIGH;   // Raw GPIO reading for debounce
-static uint32_t lastDebounceTime   = 0;      // millis() of last raw GPIO change
-static uint32_t stateStartTime     = 0;      // millis() when current state began
-static bool     downtimeReported   = false;  // True if we already reported downtime
-static bool     downtimeActive     = false;  // True while LED is ON (downtime in progress)
-static uint32_t lastStatusPrint    = 0;      // For periodic status updates
-static uint32_t lastHeartbeatSent  = 0;      // For 10s backend heartbeat
-static bool     activitySinceHb    = false;  // Tracks sensor activity for heartbeat
+// ── 3. Hardware Pin Configuration (ESP32 DevKit V1) ─────────────────────────
+static const uint8_t SENSOR_INPUT_PIN = 4;   // GPIO 4 (Collector of PC817 optocoupler)
+static const uint8_t ONBOARD_LED_PIN  = 2;   // GPIO 2 (Activity pulse indicator)
+
+// ── 4. Timing & Filter Settings ─────────────────────────────────────────────
+static const uint32_t SENSOR_DEBOUNCE_MS       = 30;    // 30ms proximity edge debounce
+static const uint32_t MIN_PULSE_INTERVAL_MS    = 1500;  // Max 1 HTTP event per 1.5s while rotating
+static const uint32_t HEARTBEAT_INTERVAL_MS    = 10000; // Background heartbeat every 10s
+static const uint32_t STATUS_PRINT_INTERVAL_MS = 3000;  // Serial status update interval
+static const uint32_t SERIAL_BAUD_RATE         = 115200;
+
+// ── 5. Runtime State ────────────────────────────────────────────────────────
+static int       currentState        = HIGH;
+static int       lastRawReading      = HIGH;
+static uint32_t  lastDebounceTime    = 0;
+
+static bool      hasRotatedSinceSend = false;
+static uint32_t  lastPulseSentTime   = 0;
+static uint32_t  lastHeartbeatSent   = 0;
+static uint32_t  lastStatusPrint     = 0;
+static bool      activitySinceHb     = false;
+static uint32_t  pulseCount          = 0;
 
 static Preferences prefs;
 static String      bootId;
-static uint32_t    bootCounter = 1;
-static uint64_t    hbSequence  = 0;
+static uint32_t    bootCounter         = 1;
+static uint64_t    hbSequence          = 0;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 const char* sensorStateLabel(int gpioState) {
-    return (gpioState == LOW) ? "ON" : "OFF";
+    return (gpioState == LOW) ? "METAL_DETECTED (LOW)" : "NO_METAL (HIGH)";
 }
 
 String generateUuidV4() {
@@ -78,65 +95,74 @@ bool postToBackend(const char* path, const String& jsonBody) {
     http.addHeader("x-device-key", DEVICE_KEY);
 
     int code = http.POST(jsonBody);
-    String resp = http.getString();
-    Serial.printf("  [API] POST %s -> HTTP %d\n", path, code);
     if (code < 200 || code >= 300) {
-        Serial.printf("  [API Error] %s\n", resp.c_str());
+        String resp = http.getString();
+        Serial.printf("  [API Error %d] %s\n", code, resp.c_str());
     }
     http.end();
     return (code >= 200 && code < 300);
 }
 
-void sendSensorEvent(const char* eventType, const char* signal, const char* holdReason = nullptr) {
+void sendSensorEvent(const char* eventType, const char* signal) {
     String meta = String("{\"rssi\":") + String(WiFi.RSSI()) +
-                  ",\"sensorState\"😕"" + sensorStateLabel(currentState) + "\"";
-    if (holdReason != nullptr) {
-        meta += String(",\"reason\"😕"") + holdReason + "\"";
-    }
-    meta += "}";
+                  ",\"pinState\":\"" + (currentState == LOW ? "LOW" : "HIGH") + "\"" +
+                  ",\"totalPulses\":" + String(pulseCount) + "}";
 
     String body = String("{") +
-        "\"eventId\"😕"" + generateUuidV4() + "\"," +
-        "\"eventType\"😕"" + eventType + "\"," +
-        "\"signal\"😕"" + signal + "\"," +
-        "\"recordedAt\"😕"" + isoNow() + "\"," +
+        "\"eventId\":\"" + generateUuidV4() + "\"," +
+        "\"eventType\":\"" + eventType + "\"," +
+        "\"signal\":\"" + signal + "\"," +
+        "\"recordedAt\":\"" + isoNow() + "\"," +
         "\"metadata\":" + meta +
     "}";
-    postToBackend("/api/iot/events", body);
+
+    if (postToBackend("/api/iot/events", body)) {
+        Serial.printf("  [EVENT SENT] %s -> %s (pulse #%u)\n", eventType, signal, pulseCount);
+    }
 }
 
 void sendHeartbeat() {
     hbSequence++;
     String body = String("{") +
-        "\"heartbeatId\"😕"" + generateUuidV4() + "\"," +
-        "\"bootId\"😕"" + bootId + "\"," +
-        "\"bootCounter\"😕"" + String(bootCounter) + "\"," +
-        "\"sequence\"😕"" + String((unsigned long)hbSequence) + "\"," +
-        "\"recordedAt\"😕"" + isoNow() + "\"," +
+        "\"heartbeatId\":\"" + generateUuidV4() + "\"," +
+        "\"bootId\":\"" + bootId + "\"," +
+        "\"bootCounter\":\"" + String(bootCounter) + "\"," +
+        "\"sequence\":\"" + String((unsigned long)hbSequence) + "\"," +
+        "\"recordedAt\":\"" + isoNow() + "\"," +
         "\"activityObserved\":" + (activitySinceHb ? "true" : "false") +
     "}";
     if (postToBackend("/api/iot/heartbeats", body)) {
+        Serial.printf("  [HEARTBEAT] Seq: %llu | Activity: %s\n", hbSequence, activitySinceHb ? "YES" : "NO");
         activitySinceHb = false;
     }
 }
 
+// ── Setup ───────────────────────────────────────────────────────────────────
 void setup() {
     Serial.begin(SERIAL_BAUD_RATE);
     delay(200);
 
-    // Configure GPIO 4 with internal pull-up (PC817 collector pulls to GND on detect)
     pinMode(SENSOR_INPUT_PIN, INPUT_PULLUP);
     pinMode(ONBOARD_LED_PIN, OUTPUT);
-    digitalWrite(ONBOARD_LED_PIN, LOW);  // LED OFF = normal at boot
+    digitalWrite(ONBOARD_LED_PIN, LOW);
 
-    // Persist monotonic bootCounter in NVS
     prefs.begin("iot-node", false);
     bootCounter = prefs.getUInt("boot_cnt", 0) + 1;
     prefs.putUInt("boot_cnt", bootCounter);
     prefs.end();
     bootId = generateUuidV4();
 
-    // Connect WiFi
+    Serial.println();
+    Serial.println(F("=============================================================="));
+    Serial.printf( "  %s — MACHINE MAIN SPINDLE MONITOR [%s]\n", NODE_ID, DEVICE_ID);
+    Serial.println(F("=============================================================="));
+    Serial.printf( "  Backend URL : %s\n", API_BASE_URL);
+    Serial.printf( "  Sensor Pin  : GPIO %d (INPUT_PULLUP via PC817)\n", SENSOR_INPUT_PIN);
+    Serial.printf( "  LED Pin     : GPIO %d (Pulse Indicator)\n", ONBOARD_LED_PIN);
+    Serial.println(F("  Logic       : Rotation toggles GPIO. Both constant HIGH"));
+    Serial.println(F("                and constant LOW indicate stopped machine."));
+    Serial.println(F("=============================================================="));
+
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     Serial.printf("Connecting to WiFi (%s)", WIFI_SSID);
     while (WiFi.status() != WL_CONNECTED) {
@@ -145,7 +171,6 @@ void setup() {
     }
     Serial.printf("\nWiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
 
-    // Sync NTP time (required by Backend: recordedAt >= 2026-05-01)
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");
     struct tm timeinfo;
     Serial.print("Syncing NTP time");
@@ -155,36 +180,17 @@ void setup() {
     }
     Serial.printf("\nNTP Synced: %s\n", isoNow().c_str());
 
-    // Read initial state
-    currentState    = digitalRead(SENSOR_INPUT_PIN);
-    previousState   = currentState;
-    lastRawReading  = currentState;
-    stateStartTime  = millis();
-    lastStatusPrint = stateStartTime;
-    lastHeartbeatSent = stateStartTime;
+    currentState      = digitalRead(SENSOR_INPUT_PIN);
+    lastRawReading    = currentState;
+    lastHeartbeatSent = millis();
+    lastStatusPrint   = millis();
 
-    // Boot banner
-    Serial.println();
-    Serial.println(F("=============================================================="));
-    Serial.println(F("  HARDWARE VALIDATION TEST — 10-Second Downtime Detection"));
-    Serial.println(F("=============================================================="));
-    Serial.printf( "  Device ID      : %s\n", DEVICE_ID);
-    Serial.printf( "  Backend URL    : %s\n", API_BASE_URL);
-    Serial.printf( "  Sensor Pin     : GPIO %d (INPUT_PULLUP)\n", SENSOR_INPUT_PIN);
-    Serial.printf( "  LED Pin        : GPIO %d (Downtime indicator)\n", ONBOARD_LED_PIN);
-    Serial.println(F("  Sensor Logic   : LOW = metal detected, HIGH = no metal"));
-    Serial.println(F("  LED Logic      : OFF = normal, ON = downtime"));
-    Serial.printf( "  Threshold      : %u seconds of unchanged state\n", DOWNTIME_THRESHOLD_MS / 1000);
-    Serial.println(F("=============================================================="));
-    Serial.printf( "  Sensor state: %s\n", sensorStateLabel(currentState));
-    Serial.println(F("  Timer started. Monitoring for downtime..."));
-    Serial.println();
-
-    // Send initial heartbeat & running pulse
     sendHeartbeat();
     sendSensorEvent("pulse", "active");
+    activitySinceHb = true;
 }
 
+// ── Main Loop ───────────────────────────────────────────────────────────────
 void loop() {
     if (WiFi.status() != WL_CONNECTED) {
         WiFi.reconnect();
@@ -193,84 +199,49 @@ void loop() {
     uint32_t now = millis();
     int reading = digitalRead(SENSOR_INPUT_PIN);
 
-    // Debounce raw GPIO input
+    // 1. Debounce and detect transitions (both bolt arrival and departure)
     if (reading != lastRawReading) {
         lastDebounceTime = now;
         lastRawReading = reading;
     }
 
-    // ── 1. Detect confirmed state change ────────────────────────────────────
-    if ((now - lastDebounceTime) >= DEBOUNCE_MS && reading != currentState) {
-        previousState  = currentState;
-        currentState   = reading;
-        stateStartTime = now;
+    if ((now - lastDebounceTime) >= SENSOR_DEBOUNCE_MS && reading != currentState) {
+        currentState = reading;
+
+        pulseCount++;
+        hasRotatedSinceSend = true;
         activitySinceHb = true;
 
-        // If downtime was active, end it immediately & send recovery to backend
-        if (downtimeActive) {
-            digitalWrite(ONBOARD_LED_PIN, LOW);  // LED OFF immediately
-            downtimeActive = false;
-            Serial.println(F(""));
-            Serial.println(F("────────────────────────────────────────────────────────────"));
-            Serial.println(F("  DOWNTIME ENDED: Sensor state changed."));
-            Serial.printf( "  Sensor state: %s\n", sensorStateLabel(currentState));
-            Serial.println(F("  Timer reset -> Sending 'recovered' to Backend..."));
-            Serial.println(F("────────────────────────────────────────────────────────────"));
-            sendSensorEvent("recovered", "active");
-        } else {
-            Serial.println(F("────────────────────────────────────────────────────────────"));
-            Serial.printf( "  Sensor state: %s\n", sensorStateLabel(currentState));
-            Serial.println(F("  Timer reset"));
-            Serial.println(F("────────────────────────────────────────────────────────────"));
-            // Send pulse on metal detection (LOW)
-            if (currentState == LOW) {
-                sendSensorEvent("pulse", "active");
-            }
-        }
-
-        downtimeReported = false;
+        digitalWrite(ONBOARD_LED_PIN, HIGH);
     }
 
-    // ── 2. Check if 10 seconds of unchanged state reached ───────────────────
-    uint32_t elapsed = now - stateStartTime;
+    // 2. Transmit throttled rotation pulse while running
+    if (hasRotatedSinceSend && (now - lastPulseSentTime >= MIN_PULSE_INTERVAL_MS)) {
+        lastPulseSentTime = now;
+        hasRotatedSinceSend = false;
 
-    if (elapsed >= DOWNTIME_THRESHOLD_MS && !downtimeReported) {
-        downtimeReported = true;
-        downtimeActive   = true;
-        digitalWrite(ONBOARD_LED_PIN, HIGH);  // LED ON = downtime
-
-        Serial.println();
-        Serial.println(F("********************************************************"));
-        if (currentState == LOW) {
-            Serial.println(F("  DOWNTIME: Sensor ON for 10 seconds -> Sending to Backend"));
-            sendSensorEvent("fault", "fault", "sensor_stuck_on_10s");
-        } else {
-            Serial.println(F("  DOWNTIME: Sensor OFF for 10 seconds -> Sending to Backend"));
-            sendSensorEvent("fault", "fault", "sensor_no_metal_10s");
-        }
-        Serial.println(F("********************************************************"));
-        Serial.println();
+        digitalWrite(ONBOARD_LED_PIN, LOW);
+        sendSensorEvent("pulse", "active");
     }
 
-    // ── 3. Periodic status print (every 2s) ─────────────────────────────────
-    if (now - lastStatusPrint >= STATUS_PRINT_INTERVAL_MS) {
-        lastStatusPrint = now;
-
-        Serial.printf( "[%7u ms] Sensor: %-3s | Held: %5u ms / %u ms | LED: %-3s | %s\n",
-                       now,
-                       sensorStateLabel(currentState),
-                       elapsed,
-                       DOWNTIME_THRESHOLD_MS,
-                       downtimeActive ? "ON" : "OFF",
-                       downtimeActive ? "DOWNTIME" : (downtimeReported ? "DOWNTIME (reported)" : "normal"));
+    // Turn LED off when stationary
+    if (!hasRotatedSinceSend && (now - lastDebounceTime > 200)) {
+        digitalWrite(ONBOARD_LED_PIN, LOW);
     }
 
-    // ── 4. Periodic Backend Heartbeat (every 10s) ───────────────────────────
+    // 3. 10s Heartbeat in background
     if (now - lastHeartbeatSent >= HEARTBEAT_INTERVAL_MS) {
         lastHeartbeatSent = now;
         sendHeartbeat();
     }
 
-    // ── 5. Yield to RTOS watchdog ───────────────────────────────────────────
+    // 4. Status log every 3s
+    if (now - lastStatusPrint >= STATUS_PRINT_INTERVAL_MS) {
+        lastStatusPrint = now;
+        uint32_t silentDurationMs = now - lastPulseSentTime;
+        Serial.printf("[%7u ms] State: %-22s | Pulses: %4u | Silence: %5u ms | WiFi: %ddBm\n",
+                      now, sensorStateLabel(currentState), pulseCount, silentDurationMs, WiFi.RSSI());
+    }
+
     delay(1);
 }
