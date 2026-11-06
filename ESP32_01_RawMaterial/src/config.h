@@ -8,12 +8,12 @@
 #define NODE_ROLE_NAME              "Raw Material Coil Monitor"
 #define FIRMWARE_VERSION            "1.1.0"
 #define DEVICE_ID                   "esp32-m01-s01"
-#define DEVICE_KEY                  "php-s-01-device-key-placeholder"
+#define DEVICE_KEY                  "php-s-01-69aa381a2460fae81724491b616ebca9e257"
 
 // ==============================================================================
 // 2. NETWORK & BACKEND CONFIGURATION
 // ==============================================================================
-#define WIFI_SSID                   "Realme 11 280"
+#define WIFI_SSID                   "Realme 11"
 #define WIFI_PASS                   "12345678900987654321"
 #define API_BASE_URL                "http://10.72.136.174:3000"
 
@@ -37,5 +37,6 @@
 // 4. SIGNAL FILTERING & TIMING THRESHOLDS
 // ==============================================================================
 #define SENSOR_DEBOUNCE_MS          50     // Stable duration (ms) to confirm state change
+#define WIFI_RECONNECT_INTERVAL_MS  5000   // Minimum gap (ms) between WiFi reconnect attempts
 #define HEARTBEAT_INTERVAL_MS       10000  // Background heartbeat interval (ms)
 #define SERIAL_BAUD_RATE            115200 // Serial Monitor baud rate

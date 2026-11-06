@@ -3,6 +3,7 @@
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <time.h>
+#include "config.h"
 
 // =============================================================================
 // ESP32 SENSOR 3 — MACHINE MAIN SENSOR (SPINDLE ROTATION MONITOR)
@@ -10,42 +11,27 @@
 // Node ID   : S-03
 // Purpose   : Monitor continuous spindle/shaft rotation via inductive proximity sensor.
 //             - Rotating (signal toggles): transmits throttled activity pulses.
-//             - Stopped (constant LOW or constant HIGH): stops emitting pulses.
-//             - Backend absence watchdog evaluates silence and triggers downtime.
+//             - Stopped (constant LOW or constant HIGH): after INACTIVITY_TIMEOUT_MS
+//               without edges, sends one idle event; rotation resumes pulses.
 // =============================================================================
 
-// ── 1. Node Identity & Backend Configuration ────────────────────────────────
-static const char* NODE_ID      = "S-03";
-static const char* DEVICE_ID    = "esp32-m01-s03";
-static const char* DEVICE_KEY   = "php-s-03-ee1ff4f1cd060acffb5b19b40dc2a1fe7be4";
-static const char* API_BASE_URL = "http://10.72.136.174:3000";
+// Identity, WiFi, backend URL, pins and timing live in config.h.
 
-// ── 2. Network Configuration ────────────────────────────────────────────────
-static const char* WIFI_SSID    = "Realme 11 280";
-static const char* WIFI_PASS    = "12345678900987654321";
-
-// ── 3. Hardware Pin Configuration (ESP32 DevKit V1) ─────────────────────────
-static const uint8_t SENSOR_INPUT_PIN = 4;   // GPIO 4 (Collector of PC817 optocoupler)
-static const uint8_t ONBOARD_LED_PIN  = 2;   // GPIO 2 (Activity pulse indicator)
-
-// ── 4. Timing & Filter Settings ─────────────────────────────────────────────
-static const uint32_t SENSOR_DEBOUNCE_MS       = 30;    // 30ms proximity edge debounce
-static const uint32_t MIN_PULSE_INTERVAL_MS    = 1500;  // Max 1 HTTP event per 1.5s while rotating
-static const uint32_t HEARTBEAT_INTERVAL_MS    = 10000; // Background heartbeat every 10s
-static const uint32_t STATUS_PRINT_INTERVAL_MS = 3000;  // Serial status update interval
-static const uint32_t SERIAL_BAUD_RATE         = 115200;
-
-// ── 5. Runtime State ────────────────────────────────────────────────────────
+// ── Runtime State ───────────────────────────────────────────────────────────
 static int       currentState        = HIGH;
 static int       lastRawReading      = HIGH;
 static uint32_t  lastDebounceTime    = 0;
 
 static bool      hasRotatedSinceSend = false;
 static uint32_t  lastPulseSentTime   = 0;
+static uint32_t  lastPulseAttempt    = 0;
 static uint32_t  lastHeartbeatSent   = 0;
 static uint32_t  lastStatusPrint     = 0;
 static bool      activitySinceHb     = false;
 static uint32_t  pulseCount          = 0;
+static uint32_t  lastEdgeTime        = 0;
+static uint32_t  lastIdleAttempt     = 0;
+static bool      stoppedReported     = false;
 
 static Preferences prefs;
 static String      bootId;
@@ -75,10 +61,10 @@ String isoNow() {
     gettimeofday(&tv, NULL);
     struct tm timeinfo;
     gmtime_r(&tv.tv_sec, &timeinfo);
-    char buf[32];
+    char buf[64];
     snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
         timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
-        timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec, tv.tv_usec / 1000);
+        timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec, (long)(tv.tv_usec / 1000));
     return String(buf);
 }
 
@@ -103,7 +89,7 @@ bool postToBackend(const char* path, const String& jsonBody) {
     return (code >= 200 && code < 300);
 }
 
-void sendSensorEvent(const char* eventType, const char* signal) {
+bool sendSensorEvent(const char* eventType, const char* signal) {
     String meta = String("{\"rssi\":") + String(WiFi.RSSI()) +
                   ",\"pinState\":\"" + (currentState == LOW ? "LOW" : "HIGH") + "\"" +
                   ",\"totalPulses\":" + String(pulseCount) + "}";
@@ -117,8 +103,10 @@ void sendSensorEvent(const char* eventType, const char* signal) {
     "}";
 
     if (postToBackend("/api/iot/events", body)) {
-        Serial.printf("  [EVENT SENT] %s -> %s (pulse #%u)\n", eventType, signal, pulseCount);
+        Serial.printf("  [EVENT SENT] %s -> %s (pulse #%lu)\n", eventType, signal, (unsigned long)pulseCount);
+        return true;
     }
+    return false;
 }
 
 void sendHeartbeat() {
@@ -135,6 +123,33 @@ void sendHeartbeat() {
         Serial.printf("  [HEARTBEAT] Seq: %llu | Activity: %s\n", hbSequence, activitySinceHb ? "YES" : "NO");
         activitySinceHb = false;
     }
+}
+
+void reconnectWifiIfNeeded() {
+    static uint32_t lastReconnectAttempt = 0;
+    if (WiFi.status() == WL_CONNECTED) return;
+    uint32_t now = millis();
+    if (now - lastReconnectAttempt < WIFI_RECONNECT_INTERVAL_MS) return;
+    lastReconnectAttempt = now;
+    Serial.println(F("  [WiFi] Disconnected, retrying..."));
+    WiFi.reconnect();
+}
+
+void markRotationEdge(uint32_t now) {
+    lastEdgeTime = now;
+    stoppedReported = false;
+}
+
+bool shouldReportStopped(uint32_t now) {
+    if (stoppedReported) return false;
+    if (now - lastEdgeTime < INACTIVITY_TIMEOUT_MS) return false;
+    return now - lastIdleAttempt >= IDLE_RETRY_INTERVAL_MS;
+}
+
+void reportStoppedIfInactive(uint32_t now) {
+    if (!shouldReportStopped(now)) return;
+    lastIdleAttempt = now;
+    stoppedReported = sendSensorEvent("idle", "idle");
 }
 
 // ── Setup ───────────────────────────────────────────────────────────────────
@@ -163,11 +178,18 @@ void setup() {
     Serial.println(F("                and constant LOW indicate stopped machine."));
     Serial.println(F("=============================================================="));
 
+    WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     Serial.printf("Connecting to WiFi (%s)", WIFI_SSID);
+    uint32_t wifiAttemptStart = millis();
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
         Serial.print(".");
+        if (millis() - wifiAttemptStart >= WIFI_RECONNECT_INTERVAL_MS) {
+            wifiAttemptStart = millis();
+            WiFi.disconnect();
+            WiFi.begin(WIFI_SSID, WIFI_PASS);
+        }
     }
     Serial.printf("\nWiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
 
@@ -175,26 +197,32 @@ void setup() {
     struct tm timeinfo;
     Serial.print("Syncing NTP time");
     while (!getLocalTime(&timeinfo) || (timeinfo.tm_year + 1900) < 2026) {
+        reconnectWifiIfNeeded();
         delay(500);
         Serial.print(".");
     }
     Serial.printf("\nNTP Synced: %s\n", isoNow().c_str());
 
+    uint32_t epochNow = (uint32_t)time(nullptr);
+    if (epochNow > bootCounter) {
+        bootCounter = epochNow;
+        prefs.begin("iot-node", false);
+        prefs.putUInt("boot_cnt", bootCounter);
+        prefs.end();
+    }
+
     currentState      = digitalRead(SENSOR_INPUT_PIN);
     lastRawReading    = currentState;
     lastHeartbeatSent = millis();
     lastStatusPrint   = millis();
+    lastEdgeTime      = millis();
 
     sendHeartbeat();
-    sendSensorEvent("pulse", "active");
-    activitySinceHb = true;
 }
 
 // ── Main Loop ───────────────────────────────────────────────────────────────
 void loop() {
-    if (WiFi.status() != WL_CONNECTED) {
-        WiFi.reconnect();
-    }
+    reconnectWifiIfNeeded();
 
     uint32_t now = millis();
     int reading = digitalRead(SENSOR_INPUT_PIN);
@@ -211,21 +239,24 @@ void loop() {
         pulseCount++;
         hasRotatedSinceSend = true;
         activitySinceHb = true;
+        markRotationEdge(now);
 
         digitalWrite(ONBOARD_LED_PIN, HIGH);
     }
 
-    // 2. Transmit throttled rotation pulse while running
-    if (hasRotatedSinceSend && (now - lastPulseSentTime >= MIN_PULSE_INTERVAL_MS)) {
-        lastPulseSentTime = now;
-        hasRotatedSinceSend = false;
-
-        digitalWrite(ONBOARD_LED_PIN, LOW);
-        sendSensorEvent("pulse", "active");
+    // 2. Transmit throttled rotation pulse while running (immediate on first edge after idle/boot)
+    if (hasRotatedSinceSend && (lastPulseAttempt == 0 || (now - lastPulseAttempt >= MIN_PULSE_INTERVAL_MS))) {
+        lastPulseAttempt = now;
+        if (sendSensorEvent("pulse", "active")) {
+            lastPulseSentTime = now;
+            hasRotatedSinceSend = false;
+        }
     }
 
-    // Turn LED off when stationary
-    if (!hasRotatedSinceSend && (now - lastDebounceTime > 200)) {
+    reportStoppedIfInactive(now);
+
+    // Keep pulse indicator LED visible for 200ms after each detected edge
+    if (now - lastDebounceTime > 200) {
         digitalWrite(ONBOARD_LED_PIN, LOW);
     }
 
@@ -239,8 +270,9 @@ void loop() {
     if (now - lastStatusPrint >= STATUS_PRINT_INTERVAL_MS) {
         lastStatusPrint = now;
         uint32_t silentDurationMs = now - lastPulseSentTime;
-        Serial.printf("[%7u ms] State: %-22s | Pulses: %4u | Silence: %5u ms | WiFi: %ddBm\n",
-                      now, sensorStateLabel(currentState), pulseCount, silentDurationMs, WiFi.RSSI());
+        Serial.printf("[%7lu ms] State: %-22s | Pulses: %4lu | Silence: %5lu ms | WiFi: %ddBm\n",
+                      (unsigned long)now, sensorStateLabel(currentState),
+                      (unsigned long)pulseCount, (unsigned long)silentDurationMs, WiFi.RSSI());
     }
 
     delay(1);

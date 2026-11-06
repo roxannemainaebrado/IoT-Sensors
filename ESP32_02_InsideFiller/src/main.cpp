@@ -3,6 +3,7 @@
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <time.h>
+#include "config.h"
 
 // =============================================================================
 // ESP32 SENSOR 2 — INSIDE FILLER WIRE AVAILABILITY & REFILL MONITOR
@@ -14,30 +15,9 @@
 //             Backend absence watchdog handles grace/idle timeout and downtime.
 // =============================================================================
 
-// ── 1. Node Identity & Backend Configuration ────────────────────────────────
-static const char* NODE_ID        = "S-02";
-static const char* NODE_ROLE_NAME = "Inside Filler Wire Monitor";
-static const char* DEVICE_ID      = "esp32-m01-s02";
-static const char* DEVICE_KEY     = "php-s-02-device-key-placeholder";
-static const char* API_BASE_URL   = "http://10.72.136.174:3000";
+// Identity, WiFi, backend URL, pins and timing live in config.h.
 
-// ── 2. Network Configuration ────────────────────────────────────────────────
-static const char* WIFI_SSID      = "Realme 11 280";
-static const char* WIFI_PASS      = "12345678900987654321";
-
-// ── 3. Hardware Pin Configuration (ESP32 DevKit V1) ─────────────────────────
-static const uint8_t SENSOR_INPUT_PIN     = 4;     // GPIO 4 (Collector of PC817 optocoupler)
-static const uint8_t ONBOARD_LED_PIN      = 2;     // GPIO 2 (Visual indicator)
-static const uint8_t SENSOR_ACTIVE_STATE  = LOW;   // LOW = Metal detected (Wire present)
-static const uint8_t LED_ALERT_STATE      = HIGH;  // Turn LED ON when alert triggered
-static const uint8_t LED_NORMAL_STATE     = LOW;   // Turn LED OFF when wire present
-
-// ── 4. Timing & Filter Settings ─────────────────────────────────────────────
-static const uint32_t SENSOR_DEBOUNCE_MS   = 50;    // 50ms stable debounce duration
-static const uint32_t HEARTBEAT_INTERVAL_MS= 10000; // 10s background heartbeat
-static const uint32_t SERIAL_BAUD_RATE     = 115200;
-
-// ── 5. Runtime State ────────────────────────────────────────────────────────
+// ── Runtime State ───────────────────────────────────────────────────────────
 enum WireState {
     WIRE_STATE_UNKNOWN = -1,
     WIRE_PRESENT = 0,         // Metal wire detected at sensing station (Active)
@@ -56,6 +36,7 @@ static uint32_t  stateStartTime        = 0;
 static uint32_t  lastHeartbeatTime     = 0;
 static uint32_t  stateChangeCount      = 0;
 static bool      activitySinceHb       = false;
+static bool      stateEventPending     = false;
 
 static Preferences prefs;
 static String      bootId;
@@ -93,10 +74,10 @@ String isoNow() {
     gettimeofday(&tv, NULL);
     struct tm timeinfo;
     gmtime_r(&tv.tv_sec, &timeinfo);
-    char buf[32];
+    char buf[64];
     snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
         timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
-        timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec, tv.tv_usec / 1000);
+        timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec, (long)(tv.tv_usec / 1000));
     return String(buf);
 }
 
@@ -121,7 +102,7 @@ bool postToBackend(const char* path, const String& jsonBody) {
     return (code >= 200 && code < 300);
 }
 
-void sendSensorEvent(const char* eventType, const char* signal) {
+bool sendSensorEvent(const char* eventType, const char* signal) {
     String meta = String("{\"rssi\":") + String(WiFi.RSSI()) +
                   ",\"wireState\":\"" + (currentWireState == WIRE_PRESENT ? "PRESENT" : "ABSENT") + "\"}";
     String body = String("{") +
@@ -133,27 +114,47 @@ void sendSensorEvent(const char* eventType, const char* signal) {
     "}";
     if (postToBackend("/api/iot/events", body)) {
         Serial.printf("  [EVENT SENT] %s -> %s\n", eventType, signal);
+        return true;
     }
+    return false;
+}
+
+bool syncCurrentStateEvent() {
+    if (currentWireState == WIRE_PRESENT) {
+        return sendSensorEvent("pulse", "active");
+    }
+    return sendSensorEvent("idle", "idle");
 }
 
 void sendHeartbeat() {
     hbSequence++;
+    bool activityObserved = activitySinceHb || currentWireState == WIRE_PRESENT;
     String body = String("{") +
         "\"heartbeatId\":\"" + generateUuidV4() + "\"," +
         "\"bootId\":\"" + bootId + "\"," +
         "\"bootCounter\":\"" + String(bootCounter) + "\"," +
         "\"sequence\":\"" + String((unsigned long)hbSequence) + "\"," +
         "\"recordedAt\":\"" + isoNow() + "\"," +
-        "\"activityObserved\":" + (activitySinceHb ? "true" : "false") +
+        "\"activityObserved\":" + (activityObserved ? "true" : "false") +
     "}";
     if (postToBackend("/api/iot/heartbeats", body)) {
-        Serial.printf("  [HEARTBEAT] Seq: %llu | Activity: %s\n", hbSequence, activitySinceHb ? "YES" : "NO");
+        Serial.printf("  [HEARTBEAT] Seq: %llu | Activity: %s\n", hbSequence, activityObserved ? "YES" : "NO");
         activitySinceHb = false;
     }
 }
 
 void updateVisualIndicator(WireState state) {
     digitalWrite(ONBOARD_LED_PIN, (state == NO_WIRE_DETECTED) ? LED_ALERT_STATE : LED_NORMAL_STATE);
+}
+
+void reconnectWifiIfNeeded() {
+    static uint32_t lastReconnectAttempt = 0;
+    if (WiFi.status() == WL_CONNECTED) return;
+    uint32_t now = millis();
+    if (now - lastReconnectAttempt < WIFI_RECONNECT_INTERVAL_MS) return;
+    lastReconnectAttempt = now;
+    Serial.println(F("  [WiFi] Disconnected, retrying..."));
+    WiFi.reconnect();
 }
 
 // ── Setup ───────────────────────────────────────────────────────────────────
@@ -180,11 +181,18 @@ void setup() {
     Serial.printf( "  LED Pin     : GPIO %d (Visual Indicator)\n", ONBOARD_LED_PIN);
     Serial.println(F("=============================================================="));
 
+    WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     Serial.printf("Connecting to WiFi (%s)", WIFI_SSID);
+    uint32_t wifiAttemptStart = millis();
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
         Serial.print(".");
+        if (millis() - wifiAttemptStart >= WIFI_RECONNECT_INTERVAL_MS) {
+            wifiAttemptStart = millis();
+            WiFi.disconnect();
+            WiFi.begin(WIFI_SSID, WIFI_PASS);
+        }
     }
     Serial.printf("\nWiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
 
@@ -192,6 +200,7 @@ void setup() {
     struct tm timeinfo;
     Serial.print("Syncing NTP time");
     while (!getLocalTime(&timeinfo) || (timeinfo.tm_year + 1900) < 2026) {
+        reconnectWifiIfNeeded();
         delay(500);
         Serial.print(".");
     }
@@ -210,18 +219,14 @@ void setup() {
     sendHeartbeat();
 
     if (currentWireState == WIRE_PRESENT) {
-        sendSensorEvent("pulse", "active");
         activitySinceHb = true;
-    } else {
-        sendSensorEvent("idle", "idle");
     }
+    stateEventPending = !syncCurrentStateEvent();
 }
 
 // ── Main Loop ───────────────────────────────────────────────────────────────
 void loop() {
-    if (WiFi.status() != WL_CONNECTED) {
-        WiFi.reconnect();
-    }
+    reconnectWifiIfNeeded();
 
     uint32_t now = millis();
     int rawReading = digitalRead(SENSOR_INPUT_PIN);
@@ -244,20 +249,21 @@ void loop() {
 
                 updateVisualIndicator(currentWireState);
 
-                Serial.printf("[%7u ms] State change: %s\n", now, getWireStateString(currentWireState));
+                Serial.printf("[%7lu ms] State change: %s\n", (unsigned long)now, getWireStateString(currentWireState));
 
                 if (currentWireState == WIRE_PRESENT) {
                     activitySinceHb = true;
-                    sendSensorEvent("pulse", "active");
-                } else {
-                    sendSensorEvent("idle", "idle");
                 }
+                stateEventPending = !syncCurrentStateEvent();
             }
         }
     }
 
     if (now - lastHeartbeatTime >= HEARTBEAT_INTERVAL_MS) {
         lastHeartbeatTime = now;
+        if (stateEventPending) {
+            stateEventPending = !syncCurrentStateEvent();
+        }
         sendHeartbeat();
     }
 

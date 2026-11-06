@@ -3,6 +3,7 @@
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <time.h>
+#include "config.h"
 
 // =============================================================================
 // ESP32 SENSOR 5 — FINISHED PRODUCT (PIPE OUTPUT) PRODUCTION COUNTER
@@ -14,29 +15,9 @@
 //             S-05 never participates in absence detection or downtime.
 // =============================================================================
 
-// ── 1. Node Identity & Backend Configuration ────────────────────────────────
-static const char* NODE_ID        = "S-05";
-static const char* NODE_ROLE_NAME = "Production Output Cutting Monitor";
-static const char* DEVICE_ID      = "esp32-m01-s05";
-static const char* DEVICE_KEY     = "php-s-05-device-key-placeholder";
-static const char* API_BASE_URL   = "http://10.72.136.174:3000";
+// Identity, WiFi, backend URL, pins and timing live in config.h.
 
-// ── 2. Network Configuration ────────────────────────────────────────────────
-static const char* WIFI_SSID      = "Realme 11 280";
-static const char* WIFI_PASS      = "12345678900987654321";
-
-// ── 3. Hardware Pin Configuration (ESP32 DevKit V1) ─────────────────────────
-static const uint8_t SENSOR_INPUT_PIN        = 4;     // GPIO 4 (Collector of PC817 optocoupler)
-static const uint8_t ONBOARD_LED_PIN         = 2;     // GPIO 2 (Pipe detection indicator)
-static const uint8_t SENSOR_DETECTED_STATE   = LOW;   // LOW  = Metal pipe present
-static const uint8_t SENSOR_CLEARED_STATE    = HIGH;  // HIGH = Gap between pipes
-
-// ── 4. Timing & Filter Settings ─────────────────────────────────────────────
-static const uint32_t SENSOR_DEBOUNCE_MS     = 50;    // 50ms stable debounce duration
-static const uint32_t HEARTBEAT_INTERVAL_MS  = 10000; // 10s background heartbeat
-static const uint32_t SERIAL_BAUD_RATE       = 115200;
-
-// ── 5. Runtime State ────────────────────────────────────────────────────────
+// ── Runtime State ───────────────────────────────────────────────────────────
 static int       currentRawReading      = HIGH;
 static int       lastRawReading         = HIGH;
 static uint32_t  lastDebounceTime       = 0;
@@ -46,6 +27,7 @@ static int       previousConfirmedState = HIGH;
 static uint32_t  pipeProductionCount    = 0;
 static uint32_t  lastHeartbeatTime      = 0;
 static bool      activitySinceHb        = false;
+static uint32_t  pendingPulseEvents     = 0;
 
 static Preferences prefs;
 static String      bootId;
@@ -71,10 +53,10 @@ String isoNow() {
     gettimeofday(&tv, NULL);
     struct tm timeinfo;
     gmtime_r(&tv.tv_sec, &timeinfo);
-    char buf[32];
+    char buf[64];
     snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
         timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
-        timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec, tv.tv_usec / 1000);
+        timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec, (long)(tv.tv_usec / 1000));
     return String(buf);
 }
 
@@ -99,7 +81,7 @@ bool postToBackend(const char* path, const String& jsonBody) {
     return (code >= 200 && code < 300);
 }
 
-void sendPulseEvent() {
+bool sendPulseEvent() {
     String meta = String("{\"rssi\":") + String(WiFi.RSSI()) +
                   ",\"pipeCount\":" + String(pipeProductionCount) + "}";
     String body = String("{") +
@@ -110,8 +92,10 @@ void sendPulseEvent() {
         "\"metadata\":" + meta +
     "}";
     if (postToBackend("/api/iot/events", body)) {
-        Serial.printf("  [PIPE COUNTED] Total: %u\n", pipeProductionCount);
+        Serial.printf("  [PIPE COUNTED] Total: %lu\n", (unsigned long)pipeProductionCount);
+        return true;
     }
+    return false;
 }
 
 void sendHeartbeat() {
@@ -125,9 +109,19 @@ void sendHeartbeat() {
         "\"activityObserved\":" + (activitySinceHb ? "true" : "false") +
     "}";
     if (postToBackend("/api/iot/heartbeats", body)) {
-        Serial.printf("  [HEARTBEAT] Seq: %llu | Output count: %u\n", hbSequence, pipeProductionCount);
+        Serial.printf("  [HEARTBEAT] Seq: %llu | Output count: %lu\n", hbSequence, (unsigned long)pipeProductionCount);
         activitySinceHb = false;
     }
+}
+
+void reconnectWifiIfNeeded() {
+    static uint32_t lastReconnectAttempt = 0;
+    if (WiFi.status() == WL_CONNECTED) return;
+    uint32_t now = millis();
+    if (now - lastReconnectAttempt < WIFI_RECONNECT_INTERVAL_MS) return;
+    lastReconnectAttempt = now;
+    Serial.println(F("  [WiFi] Disconnected, retrying..."));
+    WiFi.reconnect();
 }
 
 // ── Setup ───────────────────────────────────────────────────────────────────
@@ -153,14 +147,21 @@ void setup() {
     Serial.printf( "  Backend URL   : %s\n", API_BASE_URL);
     Serial.printf( "  Sensor Pin    : GPIO %d (INPUT_PULLUP via PC817)\n", SENSOR_INPUT_PIN);
     Serial.printf( "  LED Pin       : GPIO %d (Pipe Indicator)\n", ONBOARD_LED_PIN);
-    Serial.printf( "  Current Count : %u pipes\n", pipeProductionCount);
+    Serial.printf( "  Current Count : %lu pipes\n", (unsigned long)pipeProductionCount);
     Serial.println(F("=============================================================="));
 
+    WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     Serial.printf("Connecting to WiFi (%s)", WIFI_SSID);
+    uint32_t wifiAttemptStart = millis();
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
         Serial.print(".");
+        if (millis() - wifiAttemptStart >= WIFI_RECONNECT_INTERVAL_MS) {
+            wifiAttemptStart = millis();
+            WiFi.disconnect();
+            WiFi.begin(WIFI_SSID, WIFI_PASS);
+        }
     }
     Serial.printf("\nWiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
 
@@ -168,6 +169,7 @@ void setup() {
     struct tm timeinfo;
     Serial.print("Syncing NTP time");
     while (!getLocalTime(&timeinfo) || (timeinfo.tm_year + 1900) < 2026) {
+        reconnectWifiIfNeeded();
         delay(500);
         Serial.print(".");
     }
@@ -186,9 +188,7 @@ void setup() {
 
 // ── Main Loop ───────────────────────────────────────────────────────────────
 void loop() {
-    if (WiFi.status() != WL_CONNECTED) {
-        WiFi.reconnect();
-    }
+    reconnectWifiIfNeeded();
 
     uint32_t now = millis();
     int rawReading = digitalRead(SENSOR_INPUT_PIN);
@@ -209,14 +209,13 @@ void loop() {
 
                 digitalWrite(ONBOARD_LED_PIN, HIGH);
 
-                // Persist counter periodically in NVS
-                if (pipeProductionCount % 10 == 0) {
-                    prefs.begin("iot-node", false);
-                    prefs.putUInt("pipe_cnt", pipeProductionCount);
-                    prefs.end();
-                }
+                prefs.begin("iot-node", false);
+                prefs.putUInt("pipe_cnt", pipeProductionCount);
+                prefs.end();
 
-                sendPulseEvent();
+                if (!sendPulseEvent()) {
+                    pendingPulseEvents++;
+                }
             }
             // Detect PIPE CLEARANCE (LOW -> HIGH transition)
             else if (previousConfirmedState == SENSOR_DETECTED_STATE && debouncedPinState == SENSOR_CLEARED_STATE) {
@@ -229,6 +228,9 @@ void loop() {
 
     if (now - lastHeartbeatTime >= HEARTBEAT_INTERVAL_MS) {
         lastHeartbeatTime = now;
+        while (pendingPulseEvents > 0 && sendPulseEvent()) {
+            pendingPulseEvents--;
+        }
         sendHeartbeat();
     }
 

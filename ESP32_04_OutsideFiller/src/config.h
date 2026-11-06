@@ -9,12 +9,12 @@
 #define MONITORED_MATERIAL          "OUTSIDE FILLER WIRE"
 #define FIRMWARE_VERSION            "1.1.0"
 #define DEVICE_ID                   "esp32-m01-s04"
-#define DEVICE_KEY                  "php-s-04-device-key-placeholder"
+#define DEVICE_KEY                  "php-s-04-3e994253b5de1b312a7409c968821f9adce9"
 
 // ==============================================================================
 // 2. NETWORK & BACKEND CONFIGURATION
 // ==============================================================================
-#define WIFI_SSID                   "Realme 11 280"
+#define WIFI_SSID                   "Realme 11"
 #define WIFI_PASS                   "12345678900987654321"
 #define API_BASE_URL                "http://10.72.136.174:3000"
 
@@ -34,5 +34,6 @@
 // 4. SIGNAL FILTERING & TIMING THRESHOLDS
 // ==============================================================================
 #define SENSOR_DEBOUNCE_MS          50     // Stable duration (ms) to confirm state change
+#define WIFI_RECONNECT_INTERVAL_MS  5000   // Minimum gap (ms) between WiFi reconnect attempts
 #define HEARTBEAT_INTERVAL_MS       10000  // Periodic heartbeat interval (ms)
 #define SERIAL_BAUD_RATE            115200 // Serial Monitor baud rate
