@@ -6,38 +6,33 @@
 // ==============================================================================
 #define NODE_ID                     "S-02"
 #define NODE_ROLE_NAME              "Inside Filler Wire Monitor"
-#define FIRMWARE_VERSION            "1.0.0"
+#define FIRMWARE_VERSION            "1.1.0"
+#define DEVICE_ID                   "esp32-m01-s02"
+#define DEVICE_KEY                  "php-s-02-5c626cb5f5fd1a253275f8498ec9742d16b2"
 
 // ==============================================================================
-// 2. HARDWARE GPIO PIN CONFIGURATION (ESP32 DevKit V1 38-Pin)
+// 2. NETWORK & BACKEND CONFIGURATION
 // ==============================================================================
-// Sensor Signal Input (Collector of PC817 optocoupler)
+#define WIFI_SSID                   "Realme 11"
+#define WIFI_PASS                   "12345678900987654321"
+#define API_BASE_URL                "http://10.72.136.174:3000"
+
+// ==============================================================================
+// 3. HARDWARE GPIO PIN CONFIGURATION (ESP32 DevKit V1 38-Pin)
+// ==============================================================================
 #define SENSOR_INPUT_PIN            4      // GPIO 4 (Pin D4)
+#define ONBOARD_LED_PIN             2      // GPIO 2 (Visual indicator)
 
-// Onboard visual indicator (Blue LED on ESP32 DevKit V1)
-#define ONBOARD_LED_PIN             2      // GPIO 2
-
-// Optocoupler Inverted Logic Polarity:
-// - Metal wire present at proximity sensor -> Sensor 12V output ON -> PC817 LED ON
-// - PC817 phototransistor conducts        -> GPIO 4 pulled to GND (LOW)
-// - No metal wire at proximity sensor     -> Sensor output OFF     -> PC817 LED OFF
-// - Internal pullup holds GPIO 4 at 3.3V (HIGH)
 #define SENSOR_ACTIVE_STATE         LOW    // LOW  = Metal detected (Wire present)
 #define SENSOR_IDLE_STATE           HIGH   // HIGH = No metal detected (Wire absent)
 
-// Visual Indicator Logic (Identical to Sensor 1 Refill Alert convention):
-// - Refill Alert / No Wire : LED ON (alert operators)
-// - Wire Present (Normal)  : LED OFF
 #define LED_ALERT_STATE             HIGH   // Turn LED ON when alert triggered
 #define LED_NORMAL_STATE            LOW    // Turn LED OFF when material present
 
 // ==============================================================================
-// 3. SIGNAL FILTERING & TIMING THRESHOLDS
+// 4. SIGNAL FILTERING & TIMING THRESHOLDS
 // ==============================================================================
 #define SENSOR_DEBOUNCE_MS          50     // Stable duration (ms) to confirm state change
-#define HEARTBEAT_INTERVAL_MS       5000   // Periodic status summary interval (ms)
-
-// ==============================================================================
-// 4. SERIAL MONITOR CONFIGURATION
-// ==============================================================================
+#define WIFI_RECONNECT_INTERVAL_MS  5000   // Minimum gap (ms) between WiFi reconnect attempts
+#define HEARTBEAT_INTERVAL_MS       10000  // Periodic heartbeat interval (ms)
 #define SERIAL_BAUD_RATE            115200 // Serial Monitor baud rate

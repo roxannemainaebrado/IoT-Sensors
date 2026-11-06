@@ -16,7 +16,7 @@ static const char* DEVICE_KEY   = "php-s-03-ee1ff4f1cd060acffb5b19b40dc2a1fe7be4
 static const uint32_t DOWNTIME_THRESHOLD_MS    = 10000; // 10 seconds
 static const uint32_t STATUS_PRINT_INTERVAL_MS = 2000;  // Print status every 2s
 static const uint32_t DEBOUNCE_MS              = 50;    // 50ms PC817 edge debounce
-static const uint32_t BACKEND_HEARTBEAT_INTERVAL_MS = 10000; // Backend heartbeat every 10s
+static const uint32_t HEARTBEAT_INTERVAL_MS    = 10000; // Backend heartbeat every 10s
 
 // ── State Variables ─────────────────────────────────────────────────────────
 static int      currentState       = HIGH;   // Current debounced GPIO reading
@@ -32,12 +32,12 @@ static bool     activitySinceHb    = false;  // Tracks sensor activity for heart
 
 static Preferences prefs;
 static String      bootId;
-static uint32_t    bootCounter = 1;
-static uint64_t    hbSequence  = 0;
+static uint32_t    bootCounter         = 1;
+static uint64_t    hbSequence          = 0;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 const char* sensorStateLabel(int gpioState) {
-    return (gpioState == LOW) ? "ON" : "OFF";
+    return (gpioState == LOW) ? "METAL_DETECTED (LOW)" : "NO_METAL (HIGH)";
 }
 
 String generateUuidV4() {
@@ -58,10 +58,10 @@ String isoNow() {
     gettimeofday(&tv, NULL);
     struct tm timeinfo;
     gmtime_r(&tv.tv_sec, &timeinfo);
-    char buf[32];
+    char buf[64];
     snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
         timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
-        timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec, tv.tv_usec / 1000);
+        timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec, (long)(tv.tv_usec / 1000));
     return String(buf);
 }
 
@@ -78,20 +78,19 @@ bool postToBackend(const char* path, const String& jsonBody) {
     http.addHeader("x-device-key", DEVICE_KEY);
 
     int code = http.POST(jsonBody);
-    String resp = http.getString();
-    Serial.printf("  [API] POST %s -> HTTP %d\n", path, code);
     if (code < 200 || code >= 300) {
-        Serial.printf("  [API Error] %s\n", resp.c_str());
+        String resp = http.getString();
+        Serial.printf("  [API Error %d] %s\n", code, resp.c_str());
     }
     http.end();
     return (code >= 200 && code < 300);
 }
 
-void sendSensorEvent(const char* eventType, const char* signal, const char* holdReason = nullptr) {
+bool sendSensorEvent(const char* eventType, const char* signal) {
     String meta = String("{\"rssi\":") + String(WiFi.RSSI()) +
-                  ",\"sensorState\":\"" + sensorStateLabel(currentState) + "\"";
+                  ",\"sensorState\"😕"" + sensorStateLabel(currentState) + "\"";
     if (holdReason != nullptr) {
-        meta += String(",\"reason\":\"") + holdReason + "\"";
+        meta += String(",\"reason\"😕"") + holdReason + "\"";
     }
     meta += "}";
 
@@ -102,7 +101,12 @@ void sendSensorEvent(const char* eventType, const char* signal, const char* hold
         "\"recordedAt\":\"" + isoNow() + "\"," +
         "\"metadata\":" + meta +
     "}";
-    postToBackend("/api/iot/events", body);
+
+    if (postToBackend("/api/iot/events", body)) {
+        Serial.printf("  [EVENT SENT] %s -> %s (pulse #%lu)\n", eventType, signal, (unsigned long)pulseCount);
+        return true;
+    }
+    return false;
 }
 
 void sendHeartbeat() {
@@ -116,161 +120,160 @@ void sendHeartbeat() {
         "\"activityObserved\":" + (activitySinceHb ? "true" : "false") +
     "}";
     if (postToBackend("/api/iot/heartbeats", body)) {
+        Serial.printf("  [HEARTBEAT] Seq: %llu | Activity: %s\n", hbSequence, activitySinceHb ? "YES" : "NO");
         activitySinceHb = false;
     }
 }
 
+void reconnectWifiIfNeeded() {
+    static uint32_t lastReconnectAttempt = 0;
+    if (WiFi.status() == WL_CONNECTED) return;
+    uint32_t now = millis();
+    if (now - lastReconnectAttempt < WIFI_RECONNECT_INTERVAL_MS) return;
+    lastReconnectAttempt = now;
+    Serial.println(F("  [WiFi] Disconnected, retrying..."));
+    WiFi.reconnect();
+}
+
+void markRotationEdge(uint32_t now) {
+    lastEdgeTime = now;
+    stoppedReported = false;
+}
+
+bool shouldReportStopped(uint32_t now) {
+    if (stoppedReported) return false;
+    if (now - lastEdgeTime < INACTIVITY_TIMEOUT_MS) return false;
+    return now - lastIdleAttempt >= IDLE_RETRY_INTERVAL_MS;
+}
+
+void reportStoppedIfInactive(uint32_t now) {
+    if (!shouldReportStopped(now)) return;
+    lastIdleAttempt = now;
+    stoppedReported = sendSensorEvent("idle", "idle");
+}
+
+// ── Setup ───────────────────────────────────────────────────────────────────
 void setup() {
     Serial.begin(SERIAL_BAUD_RATE);
     delay(200);
 
-    // Configure GPIO 4 with internal pull-up (PC817 collector pulls to GND on detect)
     pinMode(SENSOR_INPUT_PIN, INPUT_PULLUP);
     pinMode(ONBOARD_LED_PIN, OUTPUT);
-    digitalWrite(ONBOARD_LED_PIN, LOW);  // LED OFF = normal at boot
+    digitalWrite(ONBOARD_LED_PIN, LOW);
 
-    // Persist monotonic bootCounter in NVS
     prefs.begin("iot-node", false);
     bootCounter = prefs.getUInt("boot_cnt", 0) + 1;
     prefs.putUInt("boot_cnt", bootCounter);
     prefs.end();
     bootId = generateUuidV4();
 
-    // Connect WiFi
+    Serial.println();
+    Serial.println(F("=============================================================="));
+    Serial.printf( "  %s — MACHINE MAIN SPINDLE MONITOR [%s]\n", NODE_ID, DEVICE_ID);
+    Serial.println(F("=============================================================="));
+    Serial.printf( "  Backend URL : %s\n", API_BASE_URL);
+    Serial.printf( "  Sensor Pin  : GPIO %d (INPUT_PULLUP via PC817)\n", SENSOR_INPUT_PIN);
+    Serial.printf( "  LED Pin     : GPIO %d (Pulse Indicator)\n", ONBOARD_LED_PIN);
+    Serial.println(F("  Logic       : Rotation toggles GPIO. Both constant HIGH"));
+    Serial.println(F("                and constant LOW indicate stopped machine."));
+    Serial.println(F("=============================================================="));
+
+    WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     Serial.printf("Connecting to WiFi (%s)", WIFI_SSID);
+    uint32_t wifiAttemptStart = millis();
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
         Serial.print(".");
+        if (millis() - wifiAttemptStart >= WIFI_RECONNECT_INTERVAL_MS) {
+            wifiAttemptStart = millis();
+            WiFi.disconnect();
+            WiFi.begin(WIFI_SSID, WIFI_PASS);
+        }
     }
     Serial.printf("\nWiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
 
-    // Sync NTP time (required by Backend: recordedAt >= 2026-05-01)
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");
     struct tm timeinfo;
     Serial.print("Syncing NTP time");
     while (!getLocalTime(&timeinfo) || (timeinfo.tm_year + 1900) < 2026) {
+        reconnectWifiIfNeeded();
         delay(500);
         Serial.print(".");
     }
     Serial.printf("\nNTP Synced: %s\n", isoNow().c_str());
 
-    // Read initial state
-    currentState    = digitalRead(SENSOR_INPUT_PIN);
-    previousState   = currentState;
-    lastRawReading  = currentState;
-    stateStartTime  = millis();
-    lastStatusPrint = stateStartTime;
-    lastHeartbeatSent = stateStartTime;
+    uint32_t epochNow = (uint32_t)time(nullptr);
+    if (epochNow > bootCounter) {
+        bootCounter = epochNow;
+        prefs.begin("iot-node", false);
+        prefs.putUInt("boot_cnt", bootCounter);
+        prefs.end();
+    }
 
-    // Boot banner
-    Serial.println();
-    Serial.println(F("=============================================================="));
-    Serial.println(F("  HARDWARE VALIDATION TEST — 10-Second Downtime Detection"));
-    Serial.println(F("=============================================================="));
-    Serial.printf( "  Device ID      : %s\n", DEVICE_ID);
-    Serial.printf( "  Backend URL    : %s\n", API_BASE_URL);
-    Serial.printf( "  Sensor Pin     : GPIO %d (INPUT_PULLUP)\n", SENSOR_INPUT_PIN);
-    Serial.printf( "  LED Pin        : GPIO %d (Downtime indicator)\n", ONBOARD_LED_PIN);
-    Serial.println(F("  Sensor Logic   : LOW = metal detected, HIGH = no metal"));
-    Serial.println(F("  LED Logic      : OFF = normal, ON = downtime"));
-    Serial.printf( "  Threshold      : %u seconds of unchanged state\n", DOWNTIME_THRESHOLD_MS / 1000);
-    Serial.println(F("=============================================================="));
-    Serial.printf( "  Sensor state: %s\n", sensorStateLabel(currentState));
-    Serial.println(F("  Timer started. Monitoring for downtime..."));
-    Serial.println();
+    currentState      = digitalRead(SENSOR_INPUT_PIN);
+    lastRawReading    = currentState;
+    lastHeartbeatSent = millis();
+    lastStatusPrint   = millis();
+    lastEdgeTime      = millis();
 
-    // Send initial heartbeat & running pulse
     sendHeartbeat();
-    sendSensorEvent("pulse", "active");
 }
 
+// ── Main Loop ───────────────────────────────────────────────────────────────
 void loop() {
-    if (WiFi.status() != WL_CONNECTED) {
-        WiFi.reconnect();
-    }
+    reconnectWifiIfNeeded();
 
     uint32_t now = millis();
     int reading = digitalRead(SENSOR_INPUT_PIN);
 
-    // Debounce raw GPIO input
+    // 1. Debounce and detect transitions (both bolt arrival and departure)
     if (reading != lastRawReading) {
         lastDebounceTime = now;
         lastRawReading = reading;
     }
 
-    // ── 1. Detect confirmed state change ────────────────────────────────────
-    if ((now - lastDebounceTime) >= DEBOUNCE_MS && reading != currentState) {
-        previousState  = currentState;
-        currentState   = reading;
-        stateStartTime = now;
+    if ((now - lastDebounceTime) >= SENSOR_DEBOUNCE_MS && reading != currentState) {
+        currentState = reading;
+
+        pulseCount++;
+        hasRotatedSinceSend = true;
         activitySinceHb = true;
+        markRotationEdge(now);
 
-        // If downtime was active, end it immediately & send recovery to backend
-        if (downtimeActive) {
-            digitalWrite(ONBOARD_LED_PIN, LOW);  // LED OFF immediately
-            downtimeActive = false;
-            Serial.println(F(""));
-            Serial.println(F("────────────────────────────────────────────────────────────"));
-            Serial.println(F("  DOWNTIME ENDED: Sensor state changed."));
-            Serial.printf( "  Sensor state: %s\n", sensorStateLabel(currentState));
-            Serial.println(F("  Timer reset -> Sending 'recovered' to Backend..."));
-            Serial.println(F("────────────────────────────────────────────────────────────"));
-            sendSensorEvent("recovered", "active");
-        } else {
-            Serial.println(F("────────────────────────────────────────────────────────────"));
-            Serial.printf( "  Sensor state: %s\n", sensorStateLabel(currentState));
-            Serial.println(F("  Timer reset"));
-            Serial.println(F("────────────────────────────────────────────────────────────"));
-            // Send pulse on metal detection (LOW)
-            if (currentState == LOW) {
-                sendSensorEvent("pulse", "active");
-            }
-        }
-
-        downtimeReported = false;
+        digitalWrite(ONBOARD_LED_PIN, HIGH);
     }
 
-    // ── 2. Check if 10 seconds of unchanged state reached ───────────────────
-    uint32_t elapsed = now - stateStartTime;
-
-    if (elapsed >= DOWNTIME_THRESHOLD_MS && !downtimeReported) {
-        downtimeReported = true;
-        downtimeActive   = true;
-        digitalWrite(ONBOARD_LED_PIN, HIGH);  // LED ON = downtime
-
-        Serial.println();
-        Serial.println(F("********************************************************"));
-        if (currentState == LOW) {
-            Serial.println(F("  DOWNTIME: Sensor ON for 10 seconds -> Sending to Backend"));
-            sendSensorEvent("fault", "fault", "sensor_stuck_on_10s");
-        } else {
-            Serial.println(F("  DOWNTIME: Sensor OFF for 10 seconds -> Sending to Backend"));
-            sendSensorEvent("fault", "fault", "sensor_no_metal_10s");
+    // 2. Transmit throttled rotation pulse while running (immediate on first edge after idle/boot)
+    if (hasRotatedSinceSend && (lastPulseAttempt == 0 || (now - lastPulseAttempt >= MIN_PULSE_INTERVAL_MS))) {
+        lastPulseAttempt = now;
+        if (sendSensorEvent("pulse", "active")) {
+            lastPulseSentTime = now;
+            hasRotatedSinceSend = false;
         }
-        Serial.println(F("********************************************************"));
-        Serial.println();
     }
 
-    // ── 3. Periodic status print (every 2s) ─────────────────────────────────
-    if (now - lastStatusPrint >= STATUS_PRINT_INTERVAL_MS) {
-        lastStatusPrint = now;
+    reportStoppedIfInactive(now);
 
-        Serial.printf( "[%7u ms] Sensor: %-3s | Held: %5u ms / %u ms | LED: %-3s | %s\n",
-                       now,
-                       sensorStateLabel(currentState),
-                       elapsed,
-                       DOWNTIME_THRESHOLD_MS,
-                       downtimeActive ? "ON" : "OFF",
-                       downtimeActive ? "DOWNTIME" : (downtimeReported ? "DOWNTIME (reported)" : "normal"));
+    // Keep pulse indicator LED visible for 200ms after each detected edge
+    if (now - lastDebounceTime > 200) {
+        digitalWrite(ONBOARD_LED_PIN, LOW);
     }
 
     // ── 4. Periodic Backend Heartbeat (every 10s) ───────────────────────────
-    if (now - lastHeartbeatSent >= BACKEND_HEARTBEAT_INTERVAL_MS) {
+    if (now - lastHeartbeatSent >= HEARTBEAT_INTERVAL_MS) {
         lastHeartbeatSent = now;
         sendHeartbeat();
     }
 
-    // ── 5. Yield to RTOS watchdog ───────────────────────────────────────────
+    // 4. Status log every 3s
+    if (now - lastStatusPrint >= STATUS_PRINT_INTERVAL_MS) {
+        lastStatusPrint = now;
+        uint32_t silentDurationMs = now - lastPulseSentTime;
+        Serial.printf("[%7lu ms] State: %-22s | Pulses: %4lu | Silence: %5lu ms | WiFi: %ddBm\n",
+                      (unsigned long)now, sensorStateLabel(currentState),
+                      (unsigned long)pulseCount, (unsigned long)silentDurationMs, WiFi.RSSI());
+    }
+
     delay(1);
 }

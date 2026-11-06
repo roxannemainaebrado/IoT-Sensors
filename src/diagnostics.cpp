@@ -37,8 +37,10 @@ void Diagnostics::logEvent(const DetectionEvent& event) {
         Serial.println();
         Serial.println(F(">>> [ALARM / TIMEOUT] >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"));
         Serial.printf(" [!] NODE %s INACTIVITY WATCHDOG TRIGGERED!\n", NODE_ID);
-        Serial.printf("     Duration without detection : %u ms (%u sec)\n", event.intervalMs, event.intervalMs / 1000);
-        Serial.printf("     Cumulative cycles before   : %u\n", event.cumulativeCount);
+        Serial.printf("     Duration without detection : %lu ms (%lu sec)\n",
+                      (unsigned long)event.intervalMs,
+                      (unsigned long)(event.intervalMs / 1000));
+        Serial.printf("     Cumulative cycles before   : %lu\n", (unsigned long)event.cumulativeCount);
         Serial.printf("     Condition reported to API  : NO_DETECTION_TIMEOUT\n");
         Serial.println(F("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<"));
         Serial.println();
@@ -46,12 +48,12 @@ void Diagnostics::logEvent(const DetectionEvent& event) {
     }
 
     // Standard detection event log
-    Serial.printf("[%9u ms] [EVENT: %-12s] | Raw GPIO: %d | Count: %4u | Delta: %5u ms\n",
-                  event.timestampMs,
+    Serial.printf("[%9lu ms] [EVENT: %-12s] | Raw GPIO: %d | Count: %4lu | Delta: %5lu ms\n",
+                  (unsigned long)event.timestampMs,
                   event.typeName,
                   _driver.readRawPin(),
-                  event.cumulativeCount,
-                  event.intervalMs);
+                  (unsigned long)event.cumulativeCount,
+                  (unsigned long)event.intervalMs);
 }
 
 void Diagnostics::checkAndLogHeartbeat() {
@@ -59,11 +61,11 @@ void Diagnostics::checkAndLogHeartbeat() {
     if (now - _lastHeartbeatTime >= HEARTBEAT_INTERVAL_MS) {
         _lastHeartbeatTime = now;
 
-        Serial.printf("[HEARTBEAT] Uptime: %6u s | State: %-7s | Cycles: %4u | Inactive: %5u ms | Heap: %6u B\n",
-                      now / 1000,
+        Serial.printf("[HEARTBEAT] Uptime: %6lu s | State: %-7s | Cycles: %4lu | Inactive: %5lu ms | Heap: %6lu B\n",
+                      (unsigned long)(now / 1000),
                       _detector.isStableDetected() ? "METAL" : "IDLE",
-                      _detector.getCount(),
-                      _detector.getMsSinceLastDetection(),
-                      ESP.getFreeHeap());
+                      (unsigned long)_detector.getCount(),
+                      (unsigned long)_detector.getMsSinceLastDetection(),
+                      (unsigned long)ESP.getFreeHeap());
     }
 }

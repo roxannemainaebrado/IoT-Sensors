@@ -1,274 +1,238 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Preferences.h>
+#include <time.h>
+#include "config.h"
+
 // =============================================================================
 // ESP32 SENSOR 5 — FINISHED PRODUCT (PIPE OUTPUT) PRODUCTION COUNTER
 // =============================================================================
-// Node ID     : S-05
-// Purpose     : Count manufactured pipes passing the flying cutter / output station.
-//
-// Target Board: ESP32 DevKit V1 (38-Pin / 30-Pin) — board = esp32dev
-//
-// Hardware Wiring Assumptions:
-//   - Sensor Signal Input : GPIO 4 (D4) <-- PC817 Optocoupler Pin 4 (Collector)
-//   - Signal Ground       : GND         <-- PC817 Optocoupler Pin 3 (Emitter)
-//   - Visual Indicator    : GPIO 2      <-- Built-in Blue LED on ESP32 DevKit V1
-//   - Sensor Type         : 12V PNP Normally Open (N.O.) Inductive Proximity Sensor
-//   - Signal Isolation    : 4-Pin PC817 Optocoupler (12V plant side isolated from 3.3V ESP32)
-//
-// Signal Logic (Active-LOW via PC817):
-//   - GPIO 4 HIGH (3.3V) : No metal detected (gap between pipes / waiting for next pipe).
-//   - GPIO 4 LOW  (0.0V) : Metal detected (pipe is currently present at sensing station).
-//
-// Initial Counting Behavior:
-//   1. IDLE / WAITING: GPIO 4 is HIGH. Counter is armed, waiting for a pipe.
-//   2. PIPE ARRIVES  : GPIO 4 transitions HIGH -> LOW.
-//                      - Production count increases by 1.
-//                      - Built-in LED turns ON.
-//                      - Detection event logged to Serial Monitor.
-//   3. PIPE REMAINS  : GPIO 4 stays LOW while the pipe passes or pauses in front of sensor.
-//                      - Production count remains unchanged (prevents duplicate counting).
-//   4. PIPE LEAVES   : GPIO 4 transitions LOW -> HIGH.
-//                      - Pipe has cleared the sensing station.
-//                      - Counter is re-armed for the next pipe.
-//                      - Built-in LED turns OFF.
-//
-// Physical Limitation Note:
-//   This counting logic requires the sensor signal to return to HIGH (inactive)
-//   between successive pipes. If pipes pass end-to-end with zero physical gap,
-//   the sensor will remain continuously LOW and will count the stream as one pipe.
+// Node ID   : S-05
+// Purpose   : Count manufactured pipes passing flying cutter / output station.
+// Logic     : Pipe arrives (HIGH -> LOW) -> Increments counter, sends 'pulse' (active), LED ON.
+//             Pipe leaves  (LOW -> HIGH) -> Counter re-armed for next pipe, LED OFF.
+//             S-05 never participates in absence detection or downtime.
 // =============================================================================
 
-#include <Arduino.h>
+// Identity, WiFi, backend URL, pins and timing live in config.h.
 
-// ==============================================================================
-// 1. HARDWARE PIN & THRESHOLD CONFIGURATION
-// ==============================================================================
+// ── Runtime State ───────────────────────────────────────────────────────────
+static int       currentRawReading      = HIGH;
+static int       lastRawReading         = HIGH;
+static uint32_t  lastDebounceTime       = 0;
+static int       debouncedPinState      = HIGH;
+static int       previousConfirmedState = HIGH;
 
-// Verify this GPIO pin against your physical wiring before connecting
-const uint8_t SENSOR_INPUT_PIN       = 4;      // GPIO 4 (D4) - Optocoupler collector input
-const uint8_t INDICATOR_LED_PIN      = 2;      // GPIO 2 (D2) - Built-in indicator LED
+static uint32_t  pipeProductionCount    = 0;
+static uint32_t  lastHeartbeatTime      = 0;
+static bool      activitySinceHb        = false;
+static uint32_t  pendingPulseEvents     = 0;
 
-// Signal Polarity (Active-LOW with PC817 optocoupler)
-const uint8_t SENSOR_DETECTED_STATE  = LOW;    // LOW  = Metal pipe present
-const uint8_t SENSOR_IDLE_STATE      = HIGH;   // HIGH = No metal (gap between pipes)
+static Preferences prefs;
+static String      bootId;
+static uint32_t    bootCounter          = 1;
+static uint64_t    hbSequence           = 0;
 
-// Visual Indicator Polarity
-const uint8_t LED_ON_STATE           = HIGH;   // Turn LED ON when pipe is present
-const uint8_t LED_OFF_STATE          = LOW;    // Turn LED OFF when sensor is idle
-
-// Timing & Filtering Configuration
-const uint32_t SENSOR_DEBOUNCE_MS    = 50;     // Stable duration (ms) required to confirm state change
-const uint32_t HEARTBEAT_INTERVAL_MS = 5000;   // Status heartbeat broadcast interval (ms)
-const uint32_t SERIAL_BAUD_RATE      = 115200; // Serial Monitor baud rate
-
-// ==============================================================================
-// 2. STATE MACHINE DEFINITIONS & VARIABLES
-// ==============================================================================
-
-enum PipeSensorState {
-    STATE_UNKNOWN = -1,
-    WAITING_FOR_PIPE = 0,   // Sensor is idle (HIGH), counter is armed
-    PIPE_PRESENT = 1        // Pipe is currently detected (LOW), count already incremented
-};
-
-// Production Metrics
-static uint32_t totalPipeCount       = 0;      // Cumulative count of finished pipes
-static uint32_t pipeDetectionTime    = 0;      // millis() when current pipe was first detected
-static uint32_t pipeClearedTime      = 0;      // millis() when previous pipe cleared
-
-// Debounce & State Tracking
-static int      currentRawReading    = HIGH;
-static int      lastRawReading       = HIGH;
-static uint32_t lastDebounceTime     = 0;
-
-static int             debouncedPinState   = HIGH;
-static PipeSensorState currentSensorState  = STATE_UNKNOWN;
-static PipeSensorState previousSensorState = STATE_UNKNOWN;
-
-// Heartbeat Tracking
-static uint32_t lastHeartbeatTime    = 0;
-
-// ==============================================================================
-// 3. HELPER FUNCTIONS
-// ==============================================================================
-
-// Convert raw GPIO reading to state
-PipeSensorState pinToSensorState(int pinValue) {
-    return (pinValue == SENSOR_DETECTED_STATE) ? PIPE_PRESENT : WAITING_FOR_PIPE;
+// ── Helpers ─────────────────────────────────────────────────────────────────
+String generateUuidV4() {
+    uint8_t b[16];
+    esp_fill_random(b, 16);
+    b[6] = (b[6] & 0x0F) | 0x40;
+    b[8] = (b[8] & 0x3F) | 0x80;
+    char out[37];
+    snprintf(out, sizeof(out),
+        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+    return String(out);
 }
 
-// State string representation for human-readable logging
-const char* getStateLabel(PipeSensorState state) {
-    switch (state) {
-        case WAITING_FOR_PIPE: return "WAITING FOR PIPE (Armed)";
-        case PIPE_PRESENT:     return "PIPE PRESENT (Detected)";
-        default:               return "INITIALIZING";
+String isoNow() {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    struct tm timeinfo;
+    gmtime_r(&tv.tv_sec, &timeinfo);
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
+        timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+        timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec, (long)(tv.tv_usec / 1000));
+    return String(buf);
+}
+
+bool postToBackend(const char* path, const String& jsonBody) {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println(F("  [API] Skipped: WiFi disconnected"));
+        return false;
+    }
+    HTTPClient http;
+    http.setTimeout(4000);
+    http.begin(String(API_BASE_URL) + path);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("x-device-id", DEVICE_ID);
+    http.addHeader("x-device-key", DEVICE_KEY);
+
+    int code = http.POST(jsonBody);
+    if (code < 200 || code >= 300) {
+        String resp = http.getString();
+        Serial.printf("  [API Error %d] %s\n", code, resp.c_str());
+    }
+    http.end();
+    return (code >= 200 && code < 300);
+}
+
+bool sendPulseEvent() {
+    String meta = String("{\"rssi\":") + String(WiFi.RSSI()) +
+                  ",\"pipeCount\":" + String(pipeProductionCount) + "}";
+    String body = String("{") +
+        "\"eventId\":\"" + generateUuidV4() + "\"," +
+        "\"eventType\":\"pulse\"," +
+        "\"signal\":\"active\"," +
+        "\"recordedAt\":\"" + isoNow() + "\"," +
+        "\"metadata\":" + meta +
+    "}";
+    if (postToBackend("/api/iot/events", body)) {
+        Serial.printf("  [PIPE COUNTED] Total: %lu\n", (unsigned long)pipeProductionCount);
+        return true;
+    }
+    return false;
+}
+
+void sendHeartbeat() {
+    hbSequence++;
+    String body = String("{") +
+        "\"heartbeatId\":\"" + generateUuidV4() + "\"," +
+        "\"bootId\":\"" + bootId + "\"," +
+        "\"bootCounter\":\"" + String(bootCounter) + "\"," +
+        "\"sequence\":\"" + String((unsigned long)hbSequence) + "\"," +
+        "\"recordedAt\":\"" + isoNow() + "\"," +
+        "\"activityObserved\":" + (activitySinceHb ? "true" : "false") +
+    "}";
+    if (postToBackend("/api/iot/heartbeats", body)) {
+        Serial.printf("  [HEARTBEAT] Seq: %llu | Output count: %lu\n", hbSequence, (unsigned long)pipeProductionCount);
+        activitySinceHb = false;
     }
 }
 
-// Display boot banner with system information and operating rules
-void printBootBanner() {
-    Serial.println();
-    Serial.println(F("================================================================================"));
-    Serial.println(F("  ESP32 SENSOR 5 — FINISHED PRODUCT (PIPE OUTPUT) PRODUCTION COUNTER"));
-    Serial.println(F("  Node Identifier  : S-05"));
-    Serial.println(F("  Firmware Version : 1.0.0 (Standalone Counting Test)"));
-    Serial.println(F("================================================================================"));
-    Serial.printf( "  Sensor Input Pin : GPIO %d (INPUT_PULLUP via PC817 Optocoupler)\n", SENSOR_INPUT_PIN);
-    Serial.printf( "  Indicator LED    : GPIO %d (Onboard Blue LED: ON when pipe detected)\n", INDICATOR_LED_PIN);
-    Serial.println(F("  Signal Logic     : LOW  = Pipe Present (Metal Detected)"));
-    Serial.println(F("                     HIGH = Idle / Gap Between Pipes (No Metal)"));
-    Serial.printf( "  Debounce Filter  : %u ms stability check\n", SENSOR_DEBOUNCE_MS);
-    Serial.printf( "  Heartbeat Period : %u ms\n", HEARTBEAT_INTERVAL_MS);
-    Serial.println(F("--------------------------------------------------------------------------------"));
-    Serial.println(F("  COUNTING RULES:"));
-    Serial.println(F("  1. HIGH -> LOW transition : New pipe detected -> Count increments by 1."));
-    Serial.println(F("  2. Sustained LOW          : Pipe is passing   -> Count remains locked."));
-    Serial.println(F("  3. LOW -> HIGH transition : Pipe has cleared  -> Counter re-armed for next."));
-    Serial.println(F("--------------------------------------------------------------------------------"));
-    Serial.println(F("  OPERATIONAL LIMITATION:"));
-    Serial.println(F("  Individual pipe counting requires a physical gap between consecutive pipes"));
-    Serial.println(F("  so the sensor signal can return to HIGH (idle) between detections."));
-    Serial.println(F("================================================================================"));
-    Serial.println();
+void reconnectWifiIfNeeded() {
+    static uint32_t lastReconnectAttempt = 0;
+    if (WiFi.status() == WL_CONNECTED) return;
+    uint32_t now = millis();
+    if (now - lastReconnectAttempt < WIFI_RECONNECT_INTERVAL_MS) return;
+    lastReconnectAttempt = now;
+    Serial.println(F("  [WiFi] Disconnected, retrying..."));
+    WiFi.reconnect();
 }
 
-// Log a pipe detection event when HIGH -> LOW transition occurs
-void logPipeDetected(uint32_t now) {
-    totalPipeCount++;
-    pipeDetectionTime = now;
-
-    uint32_t gapDurationMs = (pipeClearedTime > 0 && now >= pipeClearedTime)
-                                 ? (now - pipeClearedTime)
-                                 : 0;
-
-    Serial.println();
-    Serial.println(F("********************************************************************************"));
-    Serial.printf( "  [PIPE DETECTED] ===> TOTAL PRODUCTION COUNT: %u PIPES <===\n", totalPipeCount);
-    Serial.println(F("********************************************************************************"));
-    Serial.printf( "  Timestamp        : %u ms (Uptime: %.2f seconds)\n", now, now / 1000.0f);
-    Serial.printf( "  Sensor Reading   : GPIO %d is LOW (Metal detected)\n", SENSOR_INPUT_PIN);
-    Serial.printf( "  Indicator LED    : ON\n");
-    if (pipeClearedTime > 0) {
-        Serial.printf( "  Gap Since Last   : %u ms (%.2f seconds since previous pipe cleared)\n",
-                       gapDurationMs, gapDurationMs / 1000.0f);
-    }
-    Serial.println(F("  Status           : Pipe is currently in front of sensor. Count is locked."));
-    Serial.println(F("********************************************************************************"));
-    Serial.println();
-}
-
-// Log a pipe cleared event when LOW -> HIGH transition occurs
-void logPipeCleared(uint32_t now) {
-    pipeClearedTime = now;
-    uint32_t transitDurationMs = (pipeDetectionTime > 0 && now >= pipeDetectionTime)
-                                     ? (now - pipeDetectionTime)
-                                     : 0;
-
-    Serial.println();
-    Serial.println(F("--------------------------------------------------------------------------------"));
-    Serial.printf( "  [PIPE CLEARED] Pipe #%u has left the sensing station.\n", totalPipeCount);
-    Serial.printf( "  Sensor Reading   : GPIO %d is HIGH (Sensor idle)\n", SENSOR_INPUT_PIN);
-    Serial.printf( "  Indicator LED    : OFF\n");
-    Serial.printf( "  Transit Duration : %u ms (Pipe was in sensing field for %.2f seconds)\n",
-                   transitDurationMs, transitDurationMs / 1000.0f);
-    Serial.println(F("  Counter Status   : RE-ARMED. Ready for the next pipe."));
-    Serial.println(F("--------------------------------------------------------------------------------"));
-    Serial.println();
-}
-
-// Periodic non-intrusive status heartbeat
-void processHeartbeat(uint32_t now) {
-    if (now - lastHeartbeatTime >= HEARTBEAT_INTERVAL_MS) {
-        lastHeartbeatTime = now;
-
-        Serial.printf( "[Heartbeat %7u ms] Node: S-05 | State: %-26s | Total Pipes: %4u | Pin D4: %-4s | LED: %s\n",
-                       now,
-                       getStateLabel(currentSensorState),
-                       totalPipeCount,
-                       (debouncedPinState == LOW) ? "LOW" : "HIGH",
-                       (digitalRead(INDICATOR_LED_PIN) == LED_ON_STATE) ? "ON" : "OFF");
-    }
-}
-
-// ==============================================================================
-// 4. ARDUINO SETUP
-// ==============================================================================
-
+// ── Setup ───────────────────────────────────────────────────────────────────
 void setup() {
     Serial.begin(SERIAL_BAUD_RATE);
-    delay(300);
+    delay(200);
 
-    // Initialize GPIO pins
     pinMode(SENSOR_INPUT_PIN, INPUT_PULLUP);
-    pinMode(INDICATOR_LED_PIN, OUTPUT);
-    digitalWrite(INDICATOR_LED_PIN, LED_OFF_STATE);
+    pinMode(ONBOARD_LED_PIN, OUTPUT);
+    digitalWrite(ONBOARD_LED_PIN, LOW);
 
-    printBootBanner();
+    prefs.begin("iot-node", false);
+    bootCounter = prefs.getUInt("boot_cnt", 0) + 1;
+    prefs.putUInt("boot_cnt", bootCounter);
+    pipeProductionCount = prefs.getUInt("pipe_cnt", 0);
+    prefs.end();
+    bootId = generateUuidV4();
 
-    // Read initial hardware state
-    int initialReading = digitalRead(SENSOR_INPUT_PIN);
-    currentRawReading  = initialReading;
-    lastRawReading     = initialReading;
-    debouncedPinState  = initialReading;
+    Serial.println();
+    Serial.println(F("=============================================================="));
+    Serial.printf( "  %s — %s [%s]\n", NODE_ID, NODE_ROLE_NAME, DEVICE_ID);
+    Serial.println(F("=============================================================="));
+    Serial.printf( "  Backend URL   : %s\n", API_BASE_URL);
+    Serial.printf( "  Sensor Pin    : GPIO %d (INPUT_PULLUP via PC817)\n", SENSOR_INPUT_PIN);
+    Serial.printf( "  LED Pin       : GPIO %d (Pipe Indicator)\n", ONBOARD_LED_PIN);
+    Serial.printf( "  Current Count : %lu pipes\n", (unsigned long)pipeProductionCount);
+    Serial.println(F("=============================================================="));
 
-    currentSensorState  = pinToSensorState(debouncedPinState);
-    previousSensorState = currentSensorState;
-    lastDebounceTime    = millis();
-    lastHeartbeatTime   = millis();
-
-    // If a pipe is already sitting in front of the sensor at startup, count it
-    if (currentSensorState == PIPE_PRESENT) {
-        digitalWrite(INDICATOR_LED_PIN, LED_ON_STATE);
-        logPipeDetected(millis());
-    } else {
-        digitalWrite(INDICATOR_LED_PIN, LED_OFF_STATE);
-        Serial.printf( "  Initial State: %s. Ready to count incoming pipes.\n\n",
-                       getStateLabel(currentSensorState));
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    Serial.printf("Connecting to WiFi (%s)", WIFI_SSID);
+    uint32_t wifiAttemptStart = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+        if (millis() - wifiAttemptStart >= WIFI_RECONNECT_INTERVAL_MS) {
+            wifiAttemptStart = millis();
+            WiFi.disconnect();
+            WiFi.begin(WIFI_SSID, WIFI_PASS);
+        }
     }
+    Serial.printf("\nWiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
+
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    struct tm timeinfo;
+    Serial.print("Syncing NTP time");
+    while (!getLocalTime(&timeinfo) || (timeinfo.tm_year + 1900) < 2026) {
+        reconnectWifiIfNeeded();
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.printf("\nNTP Synced: %s\n", isoNow().c_str());
+
+    int initialReading      = digitalRead(SENSOR_INPUT_PIN);
+    currentRawReading       = initialReading;
+    lastRawReading          = initialReading;
+    debouncedPinState       = initialReading;
+    previousConfirmedState  = initialReading;
+    lastHeartbeatTime       = millis();
+
+    digitalWrite(ONBOARD_LED_PIN, (initialReading == SENSOR_DETECTED_STATE) ? HIGH : LOW);
+    sendHeartbeat();
 }
 
-// ==============================================================================
-// 5. ARDUINO LOOP
-// ==============================================================================
-
+// ── Main Loop ───────────────────────────────────────────────────────────────
 void loop() {
+    reconnectWifiIfNeeded();
+
     uint32_t now = millis();
     int rawReading = digitalRead(SENSOR_INPUT_PIN);
 
-    // ── 1. Debounce Processing ───────────────────────────────────────────────
-    // If raw pin bounced or changed, reset the debounce timer
     if (rawReading != lastRawReading) {
         lastDebounceTime = now;
         lastRawReading   = rawReading;
     }
 
-    // Only commit the state change when signal is stable for SENSOR_DEBOUNCE_MS
     if ((now - lastDebounceTime) >= SENSOR_DEBOUNCE_MS) {
         if (rawReading != debouncedPinState) {
             debouncedPinState = rawReading;
-            PipeSensorState evaluatedState = pinToSensorState(debouncedPinState);
 
-            // ── 2. Edge Detection & Counting Logic ───────────────────────────
-            if (evaluatedState != currentSensorState) {
-                previousSensorState = currentSensorState;
-                currentSensorState  = evaluatedState;
+            // Detect PIPE ARRIVAL (HIGH -> LOW transition)
+            if (previousConfirmedState == SENSOR_CLEARED_STATE && debouncedPinState == SENSOR_DETECTED_STATE) {
+                pipeProductionCount++;
+                activitySinceHb = true;
 
-                // Event A: Pipe Arrives (HIGH -> LOW)
-                if (currentSensorState == PIPE_PRESENT) {
-                    digitalWrite(INDICATOR_LED_PIN, LED_ON_STATE);
-                    logPipeDetected(now);
-                }
-                // Event B: Pipe Leaves (LOW -> HIGH)
-                else if (currentSensorState == WAITING_FOR_PIPE) {
-                    digitalWrite(INDICATOR_LED_PIN, LED_OFF_STATE);
-                    logPipeCleared(now);
+                digitalWrite(ONBOARD_LED_PIN, HIGH);
+
+                prefs.begin("iot-node", false);
+                prefs.putUInt("pipe_cnt", pipeProductionCount);
+                prefs.end();
+
+                if (!sendPulseEvent()) {
+                    pendingPulseEvents++;
                 }
             }
+            // Detect PIPE CLEARANCE (LOW -> HIGH transition)
+            else if (previousConfirmedState == SENSOR_DETECTED_STATE && debouncedPinState == SENSOR_CLEARED_STATE) {
+                digitalWrite(ONBOARD_LED_PIN, LOW);
+            }
+
+            previousConfirmedState = debouncedPinState;
         }
     }
 
-    // ── 3. Periodic Status Heartbeat ─────────────────────────────────────────
-    processHeartbeat(now);
+    if (now - lastHeartbeatTime >= HEARTBEAT_INTERVAL_MS) {
+        lastHeartbeatTime = now;
+        while (pendingPulseEvents > 0 && sendPulseEvent()) {
+            pendingPulseEvents--;
+        }
+        sendHeartbeat();
+    }
 
-    // ── 4. Yield briefly to FreeRTOS watchdog ────────────────────────────────
     delay(1);
 }
