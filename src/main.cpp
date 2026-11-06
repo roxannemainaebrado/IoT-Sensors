@@ -5,30 +5,33 @@
 #include <time.h>
 #include "config.h"
 
-// ── Network & Backend Configuration ─────────────────────────────────────────
-static const char* WIFI_SSID    = "Realme 11 280";
-static const char* WIFI_PASS    = "12345678900987654321";
-static const char* API_BASE_URL = "http://10.72.136.174:3000";
-static const char* DEVICE_ID    = "esp32-m01-s03";
-static const char* DEVICE_KEY   = "php-s-03-ee1ff4f1cd060acffb5b19b40dc2a1fe7be4";
+// =============================================================================
+// ESP32 SENSOR 3 — MACHINE MAIN SENSOR (SPINDLE ROTATION MONITOR)
+// =============================================================================
+// Node ID   : S-03
+// Purpose   : Monitor continuous spindle/shaft rotation via inductive proximity sensor.
+//             - Rotating (signal toggles): transmits throttled activity pulses.
+//             - Stopped (constant LOW or constant HIGH): after INACTIVITY_TIMEOUT_MS
+//               without edges, sends one idle event; rotation resumes pulses.
+// =============================================================================
 
-// ── Test Configuration ──────────────────────────────────────────────────────
-static const uint32_t DOWNTIME_THRESHOLD_MS    = 10000; // 10 seconds
-static const uint32_t STATUS_PRINT_INTERVAL_MS = 2000;  // Print status every 2s
-static const uint32_t DEBOUNCE_MS              = 50;    // 50ms PC817 edge debounce
-static const uint32_t HEARTBEAT_INTERVAL_MS    = 10000; // Backend heartbeat every 10s
+// Identity, WiFi, backend URL, pins and timing live in config.h.
 
-// ── State Variables ─────────────────────────────────────────────────────────
-static int      currentState       = HIGH;   // Current debounced GPIO reading
-static int      previousState      = HIGH;   // Previous reading (for edge detection)
-static int      lastRawReading     = HIGH;   // Raw GPIO reading for debounce
-static uint32_t lastDebounceTime   = 0;      // millis() of last raw GPIO change
-static uint32_t stateStartTime     = 0;      // millis() when current state began
-static bool     downtimeReported   = false;  // True if we already reported downtime
-static bool     downtimeActive     = false;  // True while LED is ON (downtime in progress)
-static uint32_t lastStatusPrint    = 0;      // For periodic status updates
-static uint32_t lastHeartbeatSent  = 0;      // For 10s backend heartbeat
-static bool     activitySinceHb    = false;  // Tracks sensor activity for heartbeat
+// ── Runtime State ───────────────────────────────────────────────────────────
+static int       currentState        = HIGH;
+static int       lastRawReading      = HIGH;
+static uint32_t  lastDebounceTime    = 0;
+
+static bool      hasRotatedSinceSend = false;
+static uint32_t  lastPulseSentTime   = 0;
+static uint32_t  lastPulseAttempt    = 0;
+static uint32_t  lastHeartbeatSent   = 0;
+static uint32_t  lastStatusPrint     = 0;
+static bool      activitySinceHb     = false;
+static uint32_t  pulseCount          = 0;
+static uint32_t  lastEdgeTime        = 0;
+static uint32_t  lastIdleAttempt     = 0;
+static bool      stoppedReported     = false;
 
 static Preferences prefs;
 static String      bootId;
@@ -88,11 +91,8 @@ bool postToBackend(const char* path, const String& jsonBody) {
 
 bool sendSensorEvent(const char* eventType, const char* signal) {
     String meta = String("{\"rssi\":") + String(WiFi.RSSI()) +
-                  ",\"sensorState\"😕"" + sensorStateLabel(currentState) + "\"";
-    if (holdReason != nullptr) {
-        meta += String(",\"reason\"😕"") + holdReason + "\"";
-    }
-    meta += "}";
+                  ",\"pinState\":\"" + (currentState == LOW ? "LOW" : "HIGH") + "\"" +
+                  ",\"totalPulses\":" + String(pulseCount) + "}";
 
     String body = String("{") +
         "\"eventId\":\"" + generateUuidV4() + "\"," +
@@ -260,7 +260,7 @@ void loop() {
         digitalWrite(ONBOARD_LED_PIN, LOW);
     }
 
-    // ── 4. Periodic Backend Heartbeat (every 10s) ───────────────────────────
+    // 3. 10s Heartbeat in background
     if (now - lastHeartbeatSent >= HEARTBEAT_INTERVAL_MS) {
         lastHeartbeatSent = now;
         sendHeartbeat();
