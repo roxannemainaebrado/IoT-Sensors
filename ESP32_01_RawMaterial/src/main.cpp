@@ -10,9 +10,17 @@
 // =============================================================================
 // Node ID   : S-01
 // Purpose   : Monitor presence of metal raw-material coil at uncoiler station.
-//             - Coil detected (LOW) : emits 'pulse' (active), LED OFF
-//             - Coil absent  (HIGH) : emits 'idle' (idle), LED ON
-//             - Backend absence watchdog handles grace/idle timeout and downtime.
+//             - Coil detected (LOW) : Running -> emits 'pulse' / 'recovered' (active), LED OFF
+//             - Coil absent  (HIGH) :
+//                 * Within dynamic trigger limit (< triggerLimitMs) : Idle  -> emits 'idle' (idle), LED ON
+//                 * Past dynamic trigger limit   (>= triggerLimitMs): Fault -> emits 'fault' (fault), LED ON
+//             - Recovery from Fault (LOW after Fault) :
+//                 * Holds Fault status (COIL_RECOVERING) until metal is continuously
+//                   detected for >= recoveryLimitMs, then transitions to Running.
+//             - Dynamic Settings Sync :
+//                 * Fetches triggerSeconds, recoverySeconds, and absenceDetectionEnabled
+//                   from GET /api/iot/config on boot and syncs response headers on
+//                   every heartbeat/event POST.
 // =============================================================================
 
 // Identity, WiFi, backend URL, pins and timing live in config.h.
@@ -20,40 +28,56 @@
 // ── Runtime State ───────────────────────────────────────────────────────────
 enum CoilState {
     COIL_STATE_UNKNOWN = -1,
-    COIL_PRESENT = 0,         // Metal detected at sensing station
-    NO_COIL_DETECTED = 1      // Metal absent (Idle observation)
+    COIL_PRESENT    = 0,      // Metal detected at sensing station (Running / Active)
+    COIL_IDLE       = 1,      // Metal absent within trigger limit (Idle / Grace)
+    COIL_FAULT      = 2,      // Metal absent past trigger limit (Fault)
+    COIL_RECOVERING = 3       // Metal detected after Fault; holding Fault until recoveryLimitMs elapses
 };
 
-static int       currentRawReading     = HIGH;
-static int       lastRawReading        = HIGH;
-static uint32_t  lastDebounceTime      = 0;
+static int       currentRawReading       = HIGH;
+static int       lastRawReading          = HIGH;
+static uint32_t  lastDebounceTime        = 0;
 
-static int       debouncedPinState     = HIGH;
-static CoilState currentCoilState      = COIL_STATE_UNKNOWN;
-static CoilState previousCoilState     = COIL_STATE_UNKNOWN;
-static uint32_t  stateStartTime        = 0;
+static int       debouncedPinState       = HIGH;
+static CoilState currentCoilState        = COIL_STATE_UNKNOWN;
+static CoilState previousCoilState       = COIL_STATE_UNKNOWN;
+static uint32_t  stateStartTime          = 0;
+static uint32_t  absenceStartTime        = 0;
+static uint32_t  recoveryStartTime       = 0;
+static uint32_t  lastPulseSentTime       = 0;
+static uint32_t  lastEventRetryTime      = 0;
+static uint32_t  lastStatusPrintTime     = 0;
 
-static uint32_t  lastHeartbeatTime     = 0;
-static uint32_t  stateChangeCount      = 0;
-static bool      activitySinceHb       = false;
-static bool      stateEventPending     = false;
+static uint32_t  lastHeartbeatTime       = 0;
+static uint32_t  stateChangeCount        = 0;
+static bool      activitySinceHb         = false;
+static bool      stateEventPending       = false;
+static bool      wasFaulted              = false;
+
+// Dynamic operational thresholds synced from Backend machine_operational_settings
+static uint32_t  triggerLimitMs          = DEFAULT_TRIGGER_LIMIT_MS;
+static uint32_t  recoveryLimitMs         = DEFAULT_RECOVERY_LIMIT_MS;
+static bool      absenceDetectionEnabled = true;
+static String    settingsVersion         = "";
 
 static Preferences prefs;
 static String      bootId;
-static uint32_t    bootCounter         = 1;
-static uint64_t    hbSequence          = 0;
+static uint32_t    bootCounter           = 1;
+static uint64_t    hbSequence            = 0;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 const char* getCoilStateString(CoilState state) {
     switch (state) {
-        case COIL_PRESENT:      return "COIL PRESENT (Active)";
-        case NO_COIL_DETECTED: return "NO COIL (Idle / Refill)";
-        default:               return "INITIALIZING";
+        case COIL_PRESENT:    return "RUNNING (Coil Present / Active)";
+        case COIL_IDLE:       return "IDLE (No Coil - Within Trigger Limit)";
+        case COIL_FAULT:      return "FAULT (No Coil - Trigger Limit Exceeded)";
+        case COIL_RECOVERING: return "RECOVERING (Hold FAULT - Confirming Recovery Limit)";
+        default:              return "INITIALIZING";
     }
 }
 
 CoilState pinReadingToCoilState(int pinValue) {
-    return (pinValue == SENSOR_ACTIVE_STATE) ? COIL_PRESENT : NO_COIL_DETECTED;
+    return (pinValue == SENSOR_ACTIVE_STATE) ? COIL_PRESENT : COIL_IDLE;
 }
 
 String generateUuidV4() {
@@ -81,20 +105,149 @@ String isoNow() {
     return String(buf);
 }
 
+void applyDynamicThresholds(int32_t triggerSec, int32_t recoverySec, int8_t absenceEnabled, const String& version) {
+    bool changed = false;
+
+    if (absenceEnabled == 0 || absenceEnabled == 1) {
+        bool enabledBool = (absenceEnabled == 1);
+        if (absenceDetectionEnabled != enabledBool) {
+            absenceDetectionEnabled = enabledBool;
+            changed = true;
+        }
+    }
+
+    if (triggerSec >= 1 && triggerSec <= 3600) {
+        uint32_t newTriggerMs = (uint32_t)triggerSec * 1000UL;
+        if (triggerLimitMs != newTriggerMs) {
+            triggerLimitMs = newTriggerMs;
+            changed = true;
+        }
+    }
+
+    if (recoverySec >= 1 && recoverySec <= 300) {
+        uint32_t newRecoveryMs = (uint32_t)recoverySec * 1000UL;
+        if (recoveryLimitMs != newRecoveryMs) {
+            recoveryLimitMs = newRecoveryMs;
+            changed = true;
+        }
+    }
+
+    if (version.length() > 0 && settingsVersion != version) {
+        settingsVersion = version;
+        changed = true;
+    }
+
+    if (changed) {
+        prefs.begin("iot-node", false);
+        prefs.putUInt("trig_ms", triggerLimitMs);
+        prefs.putUInt("rec_ms", recoveryLimitMs);
+        prefs.putBool("abs_en", absenceDetectionEnabled);
+        prefs.end();
+
+        Serial.printf("  [SETTINGS SYNC] Dynamic limits updated%s -> Trigger: %lu s (%lu ms) | Recovery: %lu s (%lu ms) | Absence Detection: %s\n",
+            settingsVersion.length() > 0 ? (String(" (v") + settingsVersion + ")").c_str() : "",
+            (unsigned long)(triggerLimitMs / 1000),
+            (unsigned long)triggerLimitMs,
+            (unsigned long)(recoveryLimitMs / 1000),
+            (unsigned long)recoveryLimitMs,
+            absenceDetectionEnabled ? "ENABLED" : "DISABLED");
+    }
+}
+
+void syncThresholdsFromHttp(HTTPClient& http) {
+    int32_t triggerSec = -1;
+    int32_t recoverySec = -1;
+    int8_t absenceEnabled = -1;
+    String version = "";
+
+    if (http.hasHeader("x-trigger-seconds")) {
+        triggerSec = http.header("x-trigger-seconds").toInt();
+    }
+    if (http.hasHeader("x-recovery-seconds")) {
+        recoverySec = http.header("x-recovery-seconds").toInt();
+    }
+    if (http.hasHeader("x-absence-enabled")) {
+        String val = http.header("x-absence-enabled");
+        val.toLowerCase();
+        if (val == "true" || val == "1") absenceEnabled = 1;
+        else if (val == "false" || val == "0") absenceEnabled = 0;
+    }
+    if (http.hasHeader("x-settings-version")) {
+        version = http.header("x-settings-version");
+    }
+
+    if (triggerSec > 0 || recoverySec > 0 || absenceEnabled != -1 || version.length() > 0) {
+        applyDynamicThresholds(triggerSec, recoverySec, absenceEnabled, version);
+    }
+}
+
+int32_t extractJsonInt(const String& json, const char* key) {
+    String pattern = String("\"") + key + "\":";
+    int idx = json.indexOf(pattern);
+    if (idx < 0) return -1;
+    idx += pattern.length();
+    while (idx < (int)json.length() && json[idx] == ' ') idx++;
+    if (idx >= (int)json.length() || !isDigit(json[idx])) return -1;
+    return json.substring(idx).toInt();
+}
+
+bool fetchDeviceConfigFromBackend() {
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    static const char* headerKeys[] = {
+        "x-trigger-seconds",
+        "x-recovery-seconds",
+        "x-absence-enabled",
+        "x-settings-version"
+    };
+
+    HTTPClient http;
+    http.setTimeout(4000);
+    http.begin(String(API_BASE_URL) + "/api/iot/config");
+    http.addHeader("x-device-id", DEVICE_ID);
+    http.addHeader("x-device-key", DEVICE_KEY);
+    http.collectHeaders(headerKeys, 4);
+
+    int code = http.GET();
+    if (code >= 200 && code < 300) {
+        syncThresholdsFromHttp(http);
+        String resp = http.getString();
+        int32_t trigSec = extractJsonInt(resp, "triggerSeconds");
+        int32_t recSec  = extractJsonInt(resp, "recoverySeconds");
+        int8_t absEn    = -1;
+        if (resp.indexOf("\"absenceDetectionEnabled\":true") >= 0) absEn = 1;
+        else if (resp.indexOf("\"absenceDetectionEnabled\":false") >= 0) absEn = 0;
+        applyDynamicThresholds(trigSec, recSec, absEn, "");
+    }
+    http.end();
+    return (code >= 200 && code < 300);
+}
+
 bool postToBackend(const char* path, const String& jsonBody) {
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println(F("  [API] Skipped: WiFi disconnected"));
         return false;
     }
+
+    static const char* headerKeys[] = {
+        "x-trigger-seconds",
+        "x-recovery-seconds",
+        "x-absence-enabled",
+        "x-settings-version"
+    };
+
     HTTPClient http;
     http.setTimeout(4000);
     http.begin(String(API_BASE_URL) + path);
     http.addHeader("Content-Type", "application/json");
     http.addHeader("x-device-id", DEVICE_ID);
     http.addHeader("x-device-key", DEVICE_KEY);
+    http.collectHeaders(headerKeys, 4);
 
     int code = http.POST(jsonBody);
-    if (code < 200 || code >= 300) {
+    if (code >= 200 && code < 300) {
+        syncThresholdsFromHttp(http);
+    } else {
         String resp = http.getString();
         Serial.printf("  [API Error %d] %s\n", code, resp.c_str());
     }
@@ -103,8 +256,16 @@ bool postToBackend(const char* path, const String& jsonBody) {
 }
 
 bool sendSensorEvent(const char* eventType, const char* signal) {
+    const char* detectionLabel = (currentCoilState == COIL_PRESENT)
+        ? "RUNNING"
+        : (currentCoilState == COIL_RECOVERING
+            ? "RECOVERING"
+            : (currentCoilState == COIL_FAULT ? "FAULT" : "IDLE"));
+    const bool coilPresentOnPin = (currentCoilState == COIL_PRESENT || currentCoilState == COIL_RECOVERING);
     String meta = String("{\"rssi\":") + String(WiFi.RSSI()) +
-                  ",\"coilState\":\"" + (currentCoilState == COIL_PRESENT ? "PRESENT" : "ABSENT") + "\"}";
+                  ",\"coilState\":\"" + (coilPresentOnPin ? "PRESENT" : "ABSENT") +
+                  "\",\"detectionState\":\"" + detectionLabel + "\"" +
+                  (strcmp(eventType, "recovered") == 0 ? ",\"recoveryConfirmed\":true" : "") + "}";
     String body = String("{") +
         "\"eventId\":\"" + generateUuidV4() + "\"," +
         "\"eventType\":\"" + eventType + "\"," +
@@ -113,7 +274,7 @@ bool sendSensorEvent(const char* eventType, const char* signal) {
         "\"metadata\":" + meta +
     "}";
     if (postToBackend("/api/iot/events", body)) {
-        Serial.printf("  [EVENT SENT] %s -> %s\n", eventType, signal);
+        Serial.printf("  [EVENT SENT] %s -> %s (Detection = %s)\n", eventType, signal, detectionLabel);
         return true;
     }
     return false;
@@ -121,14 +282,24 @@ bool sendSensorEvent(const char* eventType, const char* signal) {
 
 bool syncCurrentStateEvent() {
     if (currentCoilState == COIL_PRESENT) {
+        if (wasFaulted) {
+            if (sendSensorEvent("recovered", "active")) {
+                wasFaulted = false;
+                return true;
+            }
+            return false;
+        }
         return sendSensorEvent("pulse", "active");
+    }
+    if (currentCoilState == COIL_FAULT || currentCoilState == COIL_RECOVERING) {
+        return sendSensorEvent("fault", "fault");
     }
     return sendSensorEvent("idle", "idle");
 }
 
 void sendHeartbeat() {
     hbSequence++;
-    bool activityObserved = activitySinceHb || currentCoilState == COIL_PRESENT;
+    bool activityObserved = (currentCoilState == COIL_PRESENT) || activitySinceHb;
     String body = String("{") +
         "\"heartbeatId\":\"" + generateUuidV4() + "\"," +
         "\"bootId\":\"" + bootId + "\"," +
@@ -139,12 +310,14 @@ void sendHeartbeat() {
     "}";
     if (postToBackend("/api/iot/heartbeats", body)) {
         Serial.printf("  [HEARTBEAT] Seq: %llu | Activity: %s\n", hbSequence, activityObserved ? "YES" : "NO");
-        activitySinceHb = false;
+        if (currentCoilState != COIL_PRESENT) {
+            activitySinceHb = false;
+        }
     }
 }
 
 void updateVisualIndicator(CoilState state) {
-    digitalWrite(ONBOARD_LED_PIN, (state == NO_COIL_DETECTED) ? LED_ALERT_STATE : LED_NORMAL_STATE);
+    digitalWrite(ONBOARD_LED_PIN, (state == COIL_PRESENT) ? LED_NORMAL_STATE : LED_ALERT_STATE);
 }
 
 void reconnectWifiIfNeeded() {
@@ -169,6 +342,9 @@ void setup() {
     prefs.begin("iot-node", false);
     bootCounter = prefs.getUInt("boot_cnt", 0) + 1;
     prefs.putUInt("boot_cnt", bootCounter);
+    triggerLimitMs = prefs.getUInt("trig_ms", DEFAULT_TRIGGER_LIMIT_MS);
+    recoveryLimitMs = prefs.getUInt("rec_ms", DEFAULT_RECOVERY_LIMIT_MS);
+    absenceDetectionEnabled = prefs.getBool("abs_en", true);
     prefs.end();
     bootId = generateUuidV4();
 
@@ -176,9 +352,11 @@ void setup() {
     Serial.println(F("=============================================================="));
     Serial.printf( "  %s — %s [%s]\n", NODE_ID, NODE_ROLE_NAME, DEVICE_ID);
     Serial.println(F("=============================================================="));
-    Serial.printf( "  Backend URL : %s\n", API_BASE_URL);
-    Serial.printf( "  Sensor Pin  : GPIO %d (INPUT_PULLUP via PC817)\n", SENSOR_INPUT_PIN);
-    Serial.printf( "  LED Pin     : GPIO %d (Refill Alert Indicator)\n", ONBOARD_LED_PIN);
+    Serial.printf( "  Backend URL    : %s\n", API_BASE_URL);
+    Serial.printf( "  Sensor Pin     : GPIO %d (INPUT_PULLUP via PC817)\n", SENSOR_INPUT_PIN);
+    Serial.printf( "  LED Pin        : GPIO %d (Refill Alert Indicator)\n", ONBOARD_LED_PIN);
+    Serial.printf( "  Trigger Limit  : %lu ms (%lu s) [Dynamic]\n", (unsigned long)triggerLimitMs, (unsigned long)(triggerLimitMs / 1000));
+    Serial.printf( "  Recovery Limit : %lu ms (%lu s) [Dynamic]\n", (unsigned long)recoveryLimitMs, (unsigned long)(recoveryLimitMs / 1000));
     Serial.println(F("=============================================================="));
 
     WiFi.mode(WIFI_STA);
@@ -206,22 +384,35 @@ void setup() {
     }
     Serial.printf("\nNTP Synced: %s\n", isoNow().c_str());
 
+    uint32_t epochNow = (uint32_t)time(nullptr);
+    if (epochNow > bootCounter) {
+        bootCounter = epochNow;
+        prefs.begin("iot-node", false);
+        prefs.putUInt("boot_cnt", bootCounter);
+        prefs.end();
+    }
+
+    fetchDeviceConfigFromBackend();
+
     int initialReading = digitalRead(SENSOR_INPUT_PIN);
     currentRawReading  = initialReading;
     lastRawReading     = initialReading;
     debouncedPinState  = initialReading;
 
+    uint32_t now       = millis();
     currentCoilState   = pinReadingToCoilState(debouncedPinState);
-    stateStartTime     = millis();
-    lastHeartbeatTime  = millis();
+    stateStartTime     = now;
+    absenceStartTime   = now;
+    lastHeartbeatTime  = now;
+    lastPulseSentTime  = now;
+    lastEventRetryTime = now;
+    lastStatusPrintTime = now;
+
+    activitySinceHb    = (currentCoilState == COIL_PRESENT);
 
     updateVisualIndicator(currentCoilState);
     sendHeartbeat();
-
-    if (currentCoilState == COIL_PRESENT) {
-        activitySinceHb = true;
-    }
-    stateEventPending = !syncCurrentStateEvent();
+    stateEventPending  = !syncCurrentStateEvent();
 }
 
 // ── Main Loop ───────────────────────────────────────────────────────────────
@@ -239,32 +430,159 @@ void loop() {
     if ((now - lastDebounceTime) >= SENSOR_DEBOUNCE_MS) {
         if (rawReading != debouncedPinState) {
             debouncedPinState = rawReading;
-            CoilState evaluatedState = pinReadingToCoilState(debouncedPinState);
 
-            if (evaluatedState != currentCoilState) {
-                previousCoilState = currentCoilState;
-                currentCoilState  = evaluatedState;
-                stateStartTime    = now;
-                stateChangeCount++;
+            if (debouncedPinState == SENSOR_ACTIVE_STATE) {
+                if (currentCoilState == COIL_FAULT || wasFaulted) {
+                    // Metal detected while in FAULT -> Hold FAULT status until
+                    // metal stays continuously present for recoveryLimitMs.
+                    previousCoilState  = currentCoilState;
+                    currentCoilState   = COIL_RECOVERING;
+                    stateStartTime     = now;
+                    recoveryStartTime  = now;
+                    stateChangeCount++;
+                    activitySinceHb    = false;
 
-                updateVisualIndicator(currentCoilState);
+                    updateVisualIndicator(currentCoilState);
+                    Serial.printf("[%7lu ms] Metal detected during FAULT -> Holding FAULT for %lu s recovery limit (%s)\n",
+                        (unsigned long)now,
+                        (unsigned long)(recoveryLimitMs / 1000),
+                        getCoilStateString(currentCoilState));
+                } else if (currentCoilState != COIL_PRESENT) {
+                    // Returning from IDLE (within trigger limit) -> RUNNING
+                    previousCoilState  = currentCoilState;
+                    currentCoilState   = COIL_PRESENT;
+                    stateStartTime     = now;
+                    lastPulseSentTime  = now;
+                    lastEventRetryTime = now;
+                    stateChangeCount++;
+                    activitySinceHb    = true;
 
-                Serial.printf("[%7lu ms] State change: %s\n", (unsigned long)now, getCoilStateString(currentCoilState));
-
-                if (currentCoilState == COIL_PRESENT) {
-                    activitySinceHb = true;
+                    updateVisualIndicator(currentCoilState);
+                    Serial.printf("[%7lu ms] State change: %s\n", (unsigned long)now, getCoilStateString(currentCoilState));
+                    stateEventPending  = !syncCurrentStateEvent();
                 }
-                stateEventPending = !syncCurrentStateEvent();
+            } else {
+                if (currentCoilState == COIL_RECOVERING) {
+                    // Metal lost before recovery limit completed -> stay in FAULT
+                    uint32_t heldMs    = now - recoveryStartTime;
+                    previousCoilState  = currentCoilState;
+                    currentCoilState   = COIL_FAULT;
+                    stateStartTime     = now;
+                    recoveryStartTime  = 0;
+                    stateChangeCount++;
+                    activitySinceHb    = false;
+
+                    updateVisualIndicator(currentCoilState);
+                    Serial.printf("[%7lu ms] Metal lost before recovery limit (%lu ms < %lu ms) -> Remaining in %s\n",
+                        (unsigned long)now,
+                        (unsigned long)heldMs,
+                        (unsigned long)recoveryLimitMs,
+                        getCoilStateString(currentCoilState));
+                } else if (currentCoilState == COIL_PRESENT || currentCoilState == COIL_STATE_UNKNOWN) {
+                    // Metal absent -> starts in IDLE (within trigger limit)
+                    previousCoilState  = currentCoilState;
+                    currentCoilState   = COIL_IDLE;
+                    stateStartTime     = now;
+                    absenceStartTime   = now;
+                    lastEventRetryTime = now;
+                    stateChangeCount++;
+                    activitySinceHb    = false;
+
+                    updateVisualIndicator(currentCoilState);
+                    Serial.printf("[%7lu ms] State change: %s\n", (unsigned long)now, getCoilStateString(currentCoilState));
+                    stateEventPending  = !syncCurrentStateEvent();
+                }
             }
         }
     }
 
+    // ── Active Presence Maintenance (Detection = RUNNING) ───────────────────
+    // Emit periodic active pulses while coil is continuously present so the
+    // backend watchdog never drops Sensor 1 into Idle (grace) while Running.
+    if (currentCoilState == COIL_PRESENT) {
+        activitySinceHb = true;
+        if (!stateEventPending && (now - lastPulseSentTime >= MIN_PULSE_INTERVAL_MS)) {
+            lastPulseSentTime  = now;
+            lastEventRetryTime = now;
+            stateEventPending  = !syncCurrentStateEvent();
+        }
+    }
+
+    // ── Recovery Limit Confirmation (RECOVERING -> RUNNING past limit) ──────
+    // Holds FAULT status until metal has been continuously detected for the
+    // full dynamic recoveryLimitMs, ensuring recovery is certain before Running.
+    if (currentCoilState == COIL_RECOVERING && (now - recoveryStartTime >= recoveryLimitMs)) {
+        previousCoilState  = currentCoilState;
+        currentCoilState   = COIL_PRESENT;
+        stateStartTime     = now;
+        lastPulseSentTime  = now;
+        lastEventRetryTime = now;
+        stateChangeCount++;
+        activitySinceHb    = true;
+
+        updateVisualIndicator(currentCoilState);
+        Serial.printf("[%7lu ms] RECOVERY LIMIT MET (%lu ms >= %lu ms) -> %s\n",
+            (unsigned long)now,
+            (unsigned long)(now - recoveryStartTime),
+            (unsigned long)recoveryLimitMs,
+            getCoilStateString(currentCoilState));
+        stateEventPending  = !syncCurrentStateEvent();
+    }
+
+    // ── Trigger Limit Escalation (IDLE -> FAULT past trigger limit) ─────────
+    if (absenceDetectionEnabled && currentCoilState == COIL_IDLE && (now - absenceStartTime >= triggerLimitMs)) {
+        previousCoilState  = currentCoilState;
+        currentCoilState   = COIL_FAULT;
+        stateStartTime     = now;
+        lastEventRetryTime = now;
+        wasFaulted         = true;
+        activitySinceHb    = false;
+        stateChangeCount++;
+
+        updateVisualIndicator(currentCoilState);
+        Serial.printf("[%7lu ms] TRIGGER LIMIT EXCEEDED (%lu ms >= %lu ms) -> %s\n",
+            (unsigned long)now,
+            (unsigned long)(now - absenceStartTime),
+            (unsigned long)triggerLimitMs,
+            getCoilStateString(currentCoilState));
+        stateEventPending  = !syncCurrentStateEvent();
+    }
+
+    // ── Retry Failed State Event POST ───────────────────────────────────────
+    if (stateEventPending && (now - lastEventRetryTime >= EVENT_RETRY_INTERVAL_MS)) {
+        lastEventRetryTime = now;
+        stateEventPending  = !syncCurrentStateEvent();
+    }
+
+    // ── Background Heartbeat ────────────────────────────────────────────────
     if (now - lastHeartbeatTime >= HEARTBEAT_INTERVAL_MS) {
         lastHeartbeatTime = now;
         if (stateEventPending) {
-            stateEventPending = !syncCurrentStateEvent();
+            lastEventRetryTime = now;
+            stateEventPending  = !syncCurrentStateEvent();
         }
         sendHeartbeat();
+    }
+
+    // ── Periodic Serial Status Log ──────────────────────────────────────────
+    if (now - lastStatusPrintTime >= STATUS_PRINT_INTERVAL_MS) {
+        lastStatusPrintTime = now;
+        if (currentCoilState == COIL_PRESENT) {
+            Serial.printf("  [STATUS] Detection = RUNNING | Active for %lu s\n",
+                (unsigned long)((now - stateStartTime) / 1000));
+        } else if (currentCoilState == COIL_IDLE) {
+            Serial.printf("  [STATUS] Detection = IDLE | Absent %lu s / %lu s trigger limit\n",
+                (unsigned long)((now - absenceStartTime) / 1000),
+                (unsigned long)(triggerLimitMs / 1000));
+        } else if (currentCoilState == COIL_FAULT) {
+            Serial.printf("  [STATUS] Detection = FAULT | Absent %lu s (Trigger limit %lu s exceeded)\n",
+                (unsigned long)((now - absenceStartTime) / 1000),
+                (unsigned long)(triggerLimitMs / 1000));
+        } else if (currentCoilState == COIL_RECOVERING) {
+            Serial.printf("  [STATUS] Detection = RECOVERING (Hold FAULT) | Metal present %lu s / %lu s recovery limit\n",
+                (unsigned long)((now - recoveryStartTime) / 1000),
+                (unsigned long)(recoveryLimitMs / 1000));
+        }
     }
 
     delay(1);
