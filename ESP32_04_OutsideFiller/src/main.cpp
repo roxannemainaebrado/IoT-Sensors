@@ -106,13 +106,18 @@ String isoNow() {
 }
 
 void applyDynamicThresholds(int32_t triggerSec, int32_t recoverySec, int8_t absenceEnabled, const String& version) {
-    bool changed = false;
+    bool thresholdsChanged = false;
+    bool versionChanged = false;
 
     if (absenceEnabled == 0 || absenceEnabled == 1) {
         bool enabledBool = (absenceEnabled == 1);
         if (absenceDetectionEnabled != enabledBool) {
+            bool enablingNow = (!absenceDetectionEnabled && enabledBool);
             absenceDetectionEnabled = enabledBool;
-            changed = true;
+            thresholdsChanged = true;
+            if (enablingNow && currentWireState == WIRE_IDLE) {
+                absenceStartTime = millis();
+            }
         }
     }
 
@@ -120,7 +125,7 @@ void applyDynamicThresholds(int32_t triggerSec, int32_t recoverySec, int8_t abse
         uint32_t newTriggerMs = (uint32_t)triggerSec * 1000UL;
         if (triggerLimitMs != newTriggerMs) {
             triggerLimitMs = newTriggerMs;
-            changed = true;
+            thresholdsChanged = true;
         }
     }
 
@@ -128,22 +133,24 @@ void applyDynamicThresholds(int32_t triggerSec, int32_t recoverySec, int8_t abse
         uint32_t newRecoveryMs = (uint32_t)recoverySec * 1000UL;
         if (recoveryLimitMs != newRecoveryMs) {
             recoveryLimitMs = newRecoveryMs;
-            changed = true;
+            thresholdsChanged = true;
         }
     }
 
     if (version.length() > 0 && settingsVersion != version) {
         settingsVersion = version;
-        changed = true;
+        versionChanged = true;
     }
 
-    if (changed) {
+    if (thresholdsChanged) {
         prefs.begin("iot-node", false);
         prefs.putUInt("trig_ms", triggerLimitMs);
         prefs.putUInt("rec_ms", recoveryLimitMs);
         prefs.putBool("abs_en", absenceDetectionEnabled);
         prefs.end();
+    }
 
+    if (thresholdsChanged || versionChanged) {
         Serial.printf("  [SETTINGS SYNC] Dynamic limits updated%s -> Trigger: %lu s (%lu ms) | Recovery: %lu s (%lu ms) | Absence Detection: %s\n",
             settingsVersion.length() > 0 ? (String(" (v") + settingsVersion + ")").c_str() : "",
             (unsigned long)(triggerLimitMs / 1000),
@@ -210,14 +217,26 @@ bool fetchDeviceConfigFromBackend() {
 
     int code = http.GET();
     if (code >= 200 && code < 300) {
-        syncThresholdsFromHttp(http);
         String resp = http.getString();
-        int32_t trigSec = extractJsonInt(resp, "triggerSeconds");
-        int32_t recSec  = extractJsonInt(resp, "recoverySeconds");
-        int8_t absEn    = -1;
-        if (resp.indexOf("\"absenceDetectionEnabled\":true") >= 0) absEn = 1;
-        else if (resp.indexOf("\"absenceDetectionEnabled\":false") >= 0) absEn = 0;
-        applyDynamicThresholds(trigSec, recSec, absEn, "");
+        int32_t trigSec = http.hasHeader("x-trigger-seconds")
+            ? http.header("x-trigger-seconds").toInt()
+            : extractJsonInt(resp, "triggerSeconds");
+        int32_t recSec = http.hasHeader("x-recovery-seconds")
+            ? http.header("x-recovery-seconds").toInt()
+            : extractJsonInt(resp, "recoverySeconds");
+        int8_t absEn = -1;
+        if (http.hasHeader("x-absence-enabled")) {
+            String val = http.header("x-absence-enabled");
+            val.toLowerCase();
+            if (val == "true" || val == "1") absEn = 1;
+            else if (val == "false" || val == "0") absEn = 0;
+        } else if (resp.indexOf("\"absenceDetectionEnabled\":true") >= 0) {
+            absEn = 1;
+        } else if (resp.indexOf("\"absenceDetectionEnabled\":false") >= 0) {
+            absEn = 0;
+        }
+        String version = http.hasHeader("x-settings-version") ? http.header("x-settings-version") : "";
+        applyDynamicThresholds(trigSec, recSec, absEn, version);
     }
     http.end();
     return (code >= 200 && code < 300);
@@ -342,10 +361,12 @@ void setup() {
     prefs.begin("iot-node", false);
     bootCounter = prefs.getUInt("boot_cnt", 0) + 1;
     prefs.putUInt("boot_cnt", bootCounter);
-    triggerLimitMs = prefs.getUInt("trig_ms", DEFAULT_TRIGGER_LIMIT_MS);
-    recoveryLimitMs = prefs.getUInt("rec_ms", DEFAULT_RECOVERY_LIMIT_MS);
+    uint32_t storedTriggerMs = prefs.getUInt("trig_ms", DEFAULT_TRIGGER_LIMIT_MS);
+    uint32_t storedRecoveryMs = prefs.getUInt("rec_ms", DEFAULT_RECOVERY_LIMIT_MS);
     absenceDetectionEnabled = prefs.getBool("abs_en", true);
     prefs.end();
+    triggerLimitMs = (storedTriggerMs >= 1000UL && storedTriggerMs <= 3600000UL) ? storedTriggerMs : DEFAULT_TRIGGER_LIMIT_MS;
+    recoveryLimitMs = (storedRecoveryMs >= 1000UL && storedRecoveryMs <= 300000UL) ? storedRecoveryMs : DEFAULT_RECOVERY_LIMIT_MS;
     bootId = generateUuidV4();
 
     Serial.println();
@@ -420,6 +441,37 @@ void loop() {
     reconnectWifiIfNeeded();
 
     uint32_t now = millis();
+
+    if (!absenceDetectionEnabled) {
+        if (currentWireState == WIRE_RECOVERING) {
+            previousWireState  = currentWireState;
+            currentWireState   = WIRE_PRESENT;
+            recoveryStartTime  = 0;
+            stateStartTime     = now;
+            lastPulseSentTime  = now;
+            lastEventRetryTime = now;
+            stateChangeCount++;
+            activitySinceHb    = true;
+
+            updateVisualIndicator(currentWireState);
+            Serial.printf("[%7lu ms] Absence detection disabled during RECOVERING -> %s\n",
+                (unsigned long)now, getWireStateString(currentWireState));
+            stateEventPending  = !syncCurrentStateEvent();
+        } else if (currentWireState == WIRE_FAULT) {
+            previousWireState  = currentWireState;
+            currentWireState   = WIRE_IDLE;
+            stateStartTime     = now;
+            lastEventRetryTime = now;
+            stateChangeCount++;
+            activitySinceHb    = false;
+
+            updateVisualIndicator(currentWireState);
+            Serial.printf("[%7lu ms] Absence detection disabled during FAULT -> %s\n",
+                (unsigned long)now, getWireStateString(currentWireState));
+            stateEventPending  = !syncCurrentStateEvent();
+        }
+    }
+
     int rawReading = digitalRead(SENSOR_INPUT_PIN);
 
     if (rawReading != lastRawReading) {
@@ -432,7 +484,7 @@ void loop() {
             debouncedPinState = rawReading;
 
             if (debouncedPinState == SENSOR_ACTIVE_STATE) {
-                if (currentWireState == WIRE_FAULT || wasFaulted) {
+                if (absenceDetectionEnabled && (currentWireState == WIRE_FAULT || wasFaulted)) {
                     // Metal wire detected while in FAULT -> Hold FAULT status until
                     // wire stays continuously present for recoveryLimitMs.
                     previousWireState  = currentWireState;
