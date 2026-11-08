@@ -283,6 +283,7 @@ SPINDLE_CONSTEXPR SpindleStepResult spindleStep(
         } else if (rt.currentState == SPINDLE_FAULT) {
             rt.previousState = rt.currentState;
             rt.currentState = SPINDLE_IDLE;
+            rt.wasFaulted = false;
             rt.stateStartTime = nowMs;
             rt.lastEventRetryTime = nowMs;
             rt.stateChangeCount++;

@@ -119,34 +119,35 @@ constexpr bool testBugC3DisablingAbsenceDetectionExitsFaultAndRecovering() {
     SpindleThresholdConfig cfg{3000, 60000, 60000, false, false};
     SpindleEdgeBatch emptyBatch{0, 1000, PIN_HIGH_IDLE, 0, 0, 0, 0, 0, 1000, 1000, false};
 
-    // Case A: Stopped in SPINDLE_FAULT -> must immediately reconcile to SPINDLE_IDLE and sync state
+    // Case A: Stopped in SPINDLE_FAULT -> must immediately reconcile to SPINDLE_IDLE, clear wasFaulted, and sync state
     SpindleRuntimeState rtFault = makeSpindleRuntimeState(PIN_HIGH_IDLE, 0);
     rtFault.currentState = SPINDLE_FAULT;
     rtFault.wasFaulted = true;
     rtFault.lastEdgeTime = 0;
     SpindleStepResult actA = spindleStep(rtFault, emptyBatch, 5000, cfg);
-    if (rtFault.currentState != SPINDLE_IDLE || actA.syncAction != SPINDLE_SYNC_STATE || !rtFault.wasFaulted) {
+    if (rtFault.currentState != SPINDLE_IDLE || actA.syncAction != SPINDLE_SYNC_STATE || rtFault.wasFaulted) {
         return false;
     }
 
-    // Next 2 rotation edges while absenceDetectionEnabled == false must go straight to SPINDLE_RUNNING (not RECOVERING)
+    // Re-enabling absenceDetectionEnabled while in SPINDLE_IDLE and receiving 2 rotation edges must go straight to SPINDLE_RUNNING (not RECOVERING)
+    SpindleThresholdConfig cfgReenabled{3000, 60000, 60000, true, false};
     SpindleIsrState isr = makeSpindleIsrState(PIN_HIGH_IDLE, 5000, 3000);
     spindleIsrOnPinSample(isr, 5100, PIN_LOW_ACTIVE, PIN_LOW_ACTIVE, DEBOUNCE_MS);
     spindleIsrOnPinSample(isr, 5300, PIN_HIGH_IDLE, PIN_LOW_ACTIVE, DEBOUNCE_MS); // edge 1 @ 5150
     SpindleEdgeBatch twoEdges = spindleConsumeCycleLocked(isr, 5400, PIN_HIGH_IDLE, PIN_LOW_ACTIVE, DEBOUNCE_MS); // edge 2 @ 5350
-    SpindleStepResult actRotate = spindleStep(rtFault, twoEdges, 5400, cfg);
+    SpindleStepResult actRotate = spindleStep(rtFault, twoEdges, 5400, cfgReenabled);
     if (rtFault.currentState != SPINDLE_RUNNING || actRotate.syncAction != SPINDLE_SYNC_STATE) {
         return false;
     }
 
-    // Case B: Rotating in SPINDLE_RECOVERING -> must immediately reconcile to SPINDLE_RUNNING
+    // Case B: Rotating in SPINDLE_RECOVERING -> must immediately reconcile to SPINDLE_RUNNING and keep wasFaulted so syncCurrentStateEvent emits 'recovered' with recoveryConfirmed:true
     SpindleRuntimeState rtRec = makeSpindleRuntimeState(PIN_HIGH_IDLE, 0);
     rtRec.currentState = SPINDLE_RECOVERING;
     rtRec.wasFaulted = true;
     rtRec.recoveryStartTime = 4000;
     rtRec.lastEdgeTime = 4900;
     SpindleStepResult actB = spindleStep(rtRec, emptyBatch, 5000, cfg);
-    return rtRec.currentState == SPINDLE_RUNNING && rtRec.recoveryStartTime == 0 && actB.syncAction == SPINDLE_SYNC_STATE;
+    return rtRec.currentState == SPINDLE_RUNNING && rtRec.wasFaulted && rtRec.recoveryStartTime == 0 && actB.syncAction == SPINDLE_SYNC_STATE;
 }
 
 // ---------------------------------------------------------------------------
