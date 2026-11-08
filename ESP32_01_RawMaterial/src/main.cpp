@@ -53,6 +53,12 @@ static uint32_t  stateChangeCount        = 0;
 static bool      activitySinceHb         = false;
 static bool      stateEventPending       = false;
 static bool      wasFaulted              = false;
+static String    pendingEventId          = "";
+static String    pendingRecordedAt       = "";
+static String    pendingEventType        = "";
+static String    pendingSignal           = "";
+static bool      ntpSynced               = false;
+static bool      configSynced            = false;
 
 // Dynamic operational thresholds synced from Backend machine_operational_settings
 static uint32_t  triggerLimitMs          = DEFAULT_TRIGGER_LIMIT_MS;
@@ -91,6 +97,20 @@ String generateUuidV4() {
         b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
         b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
     return String(out);
+}
+
+bool isClockSynced() {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    struct tm timeinfo;
+    gmtime_r(&tv.tv_sec, &timeinfo);
+    return (timeinfo.tm_year + 1900) >= 2026;
+}
+
+String formatUint64(uint64_t val) {
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%llu", (unsigned long long)val);
+    return String(buf);
 }
 
 String isoNow() {
@@ -209,7 +229,8 @@ bool fetchDeviceConfigFromBackend() {
     };
 
     HTTPClient http;
-    http.setTimeout(4000);
+    http.setConnectTimeout(2000);
+    http.setTimeout(2500);
     http.begin(String(API_BASE_URL) + "/api/iot/config");
     http.addHeader("x-device-id", DEVICE_ID);
     http.addHeader("x-device-key", DEVICE_KEY);
@@ -256,7 +277,8 @@ bool postToBackend(const char* path, const String& jsonBody) {
     };
 
     HTTPClient http;
-    http.setTimeout(4000);
+    http.setConnectTimeout(2000);
+    http.setTimeout(2500);
     http.begin(String(API_BASE_URL) + path);
     http.addHeader("Content-Type", "application/json");
     http.addHeader("x-device-id", DEVICE_ID);
@@ -267,14 +289,18 @@ bool postToBackend(const char* path, const String& jsonBody) {
     if (code >= 200 && code < 300) {
         syncThresholdsFromHttp(http);
     } else {
-        String resp = http.getString();
+        String resp = (code > 0) ? http.getString() : "";
         Serial.printf("  [API Error %d] %s\n", code, resp.c_str());
     }
     http.end();
     return (code >= 200 && code < 300);
 }
 
-bool sendSensorEvent(const char* eventType, const char* signal) {
+bool sendSensorEvent(
+    const char* eventType,
+    const char* signal,
+    const String& eventId,
+    const String& recordedAt) {
     const char* detectionLabel = (currentCoilState == COIL_PRESENT)
         ? "RUNNING"
         : (currentCoilState == COIL_RECOVERING
@@ -286,10 +312,10 @@ bool sendSensorEvent(const char* eventType, const char* signal) {
                   "\",\"detectionState\":\"" + detectionLabel + "\"" +
                   (strcmp(eventType, "recovered") == 0 ? ",\"recoveryConfirmed\":true" : "") + "}";
     String body = String("{") +
-        "\"eventId\":\"" + generateUuidV4() + "\"," +
+        "\"eventId\":\"" + eventId + "\"," +
         "\"eventType\":\"" + eventType + "\"," +
         "\"signal\":\"" + signal + "\"," +
-        "\"recordedAt\":\"" + isoNow() + "\"," +
+        "\"recordedAt\":\"" + recordedAt + "\"," +
         "\"metadata\":" + meta +
     "}";
     if (postToBackend("/api/iot/events", body)) {
@@ -299,31 +325,55 @@ bool sendSensorEvent(const char* eventType, const char* signal) {
     return false;
 }
 
-bool syncCurrentStateEvent() {
+bool syncCurrentStateEvent(bool forceNewEvent = true) {
+    if (!isClockSynced()) {
+        return false;
+    }
+
+    const char* targetEventType = "idle";
+    const char* targetSignal    = "idle";
     if (currentCoilState == COIL_PRESENT) {
-        if (wasFaulted) {
-            if (sendSensorEvent("recovered", "active")) {
-                wasFaulted = false;
-                return true;
-            }
-            return false;
+        targetEventType = wasFaulted ? "recovered" : "pulse";
+        targetSignal    = "active";
+    } else if (currentCoilState == COIL_FAULT || currentCoilState == COIL_RECOVERING) {
+        targetEventType = "fault";
+        targetSignal    = "fault";
+    }
+
+    if (forceNewEvent ||
+        pendingEventId.length() == 0 ||
+        pendingEventType != targetEventType ||
+        pendingSignal != targetSignal) {
+        pendingEventId    = generateUuidV4();
+        pendingRecordedAt = isoNow();
+        pendingEventType  = targetEventType;
+        pendingSignal     = targetSignal;
+    } else if (!pendingRecordedAt.startsWith("20") && isClockSynced()) {
+        pendingRecordedAt = isoNow();
+    }
+
+    if (sendSensorEvent(pendingEventType.c_str(), pendingSignal.c_str(), pendingEventId, pendingRecordedAt)) {
+        if (pendingEventType == "recovered") {
+            wasFaulted = false;
         }
-        return sendSensorEvent("pulse", "active");
+        pendingEventId    = "";
+        pendingRecordedAt = "";
+        return true;
     }
-    if (currentCoilState == COIL_FAULT || currentCoilState == COIL_RECOVERING) {
-        return sendSensorEvent("fault", "fault");
-    }
-    return sendSensorEvent("idle", "idle");
+    return false;
 }
 
 void sendHeartbeat() {
+    if (!isClockSynced()) {
+        return;
+    }
     hbSequence++;
     bool activityObserved = (currentCoilState == COIL_PRESENT) || activitySinceHb;
     String body = String("{") +
         "\"heartbeatId\":\"" + generateUuidV4() + "\"," +
         "\"bootId\":\"" + bootId + "\"," +
         "\"bootCounter\":\"" + String(bootCounter) + "\"," +
-        "\"sequence\":\"" + String((unsigned long)hbSequence) + "\"," +
+        "\"sequence\":\"" + formatUint64(hbSequence) + "\"," +
         "\"recordedAt\":\"" + isoNow() + "\"," +
         "\"activityObserved\":" + (activityObserved ? "true" : "false") +
     "}";
@@ -383,8 +433,9 @@ void setup() {
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     Serial.printf("Connecting to WiFi (%s)", WIFI_SSID);
-    uint32_t wifiAttemptStart = millis();
-    while (WiFi.status() != WL_CONNECTED) {
+    uint32_t wifiSetupStart = millis();
+    uint32_t wifiAttemptStart = wifiSetupStart;
+    while (WiFi.status() != WL_CONNECTED && (millis() - wifiSetupStart < 15000UL)) {
         delay(500);
         Serial.print(".");
         if (millis() - wifiAttemptStart >= WIFI_RECONNECT_INTERVAL_MS) {
@@ -393,27 +444,37 @@ void setup() {
             WiFi.begin(WIFI_SSID, WIFI_PASS);
         }
     }
-    Serial.printf("\nWiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("\nWiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
+    } else {
+        Serial.println(F("\nWiFi not ready within 15 s — continuing offline; background reconnect active."));
+    }
 
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-    struct tm timeinfo;
-    Serial.print("Syncing NTP time");
-    while (!getLocalTime(&timeinfo) || (timeinfo.tm_year + 1900) < 2026) {
-        reconnectWifiIfNeeded();
-        delay(500);
-        Serial.print(".");
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.print("Syncing NTP time");
+        uint32_t ntpSetupStart = millis();
+        while (!isClockSynced() && (millis() - ntpSetupStart < 15000UL)) {
+            reconnectWifiIfNeeded();
+            delay(500);
+            Serial.print(".");
+        }
     }
-    Serial.printf("\nNTP Synced: %s\n", isoNow().c_str());
-
-    uint32_t epochNow = (uint32_t)time(nullptr);
-    if (epochNow > bootCounter) {
-        bootCounter = epochNow;
-        prefs.begin("iot-node", false);
-        prefs.putUInt("boot_cnt", bootCounter);
-        prefs.end();
+    if (isClockSynced()) {
+        ntpSynced = true;
+        Serial.printf("\nNTP Synced: %s\n", isoNow().c_str());
+        uint32_t epochNow = (uint32_t)time(nullptr);
+        if (epochNow > bootCounter) {
+            bootCounter = epochNow;
+            prefs.begin("iot-node", false);
+            prefs.putUInt("boot_cnt", bootCounter);
+            prefs.end();
+        }
+    } else {
+        Serial.println(F("\nNTP not synced yet — will complete in background once online."));
     }
 
-    fetchDeviceConfigFromBackend();
+    configSynced = fetchDeviceConfigFromBackend();
 
     int initialReading = digitalRead(SENSOR_INPUT_PIN);
     currentRawReading  = initialReading;
@@ -439,8 +500,23 @@ void setup() {
 // ── Main Loop ───────────────────────────────────────────────────────────────
 void loop() {
     reconnectWifiIfNeeded();
+    if (!ntpSynced && isClockSynced()) {
+        ntpSynced = true;
+        uint32_t epochNow = (uint32_t)time(nullptr);
+        if (epochNow > bootCounter) {
+            bootCounter = epochNow;
+            prefs.begin("iot-node", false);
+            prefs.putUInt("boot_cnt", bootCounter);
+            prefs.end();
+        }
+        Serial.printf("  [NTP] Background sync complete: %s\n", isoNow().c_str());
+    }
+    if (!configSynced && WiFi.status() == WL_CONNECTED) {
+        configSynced = fetchDeviceConfigFromBackend();
+    }
 
     uint32_t now = millis();
+    bool eventFailedThisPass = false;
 
     if (!absenceDetectionEnabled) {
         if (currentCoilState == COIL_RECOVERING) {
@@ -456,10 +532,12 @@ void loop() {
             updateVisualIndicator(currentCoilState);
             Serial.printf("[%7lu ms] Absence detection disabled during RECOVERING -> %s\n",
                 (unsigned long)now, getCoilStateString(currentCoilState));
-            stateEventPending  = !syncCurrentStateEvent();
+            stateEventPending  = !syncCurrentStateEvent(true);
+            if (stateEventPending) eventFailedThisPass = true;
         } else if (currentCoilState == COIL_FAULT) {
             previousCoilState  = currentCoilState;
             currentCoilState   = COIL_IDLE;
+            wasFaulted         = false;
             stateStartTime     = now;
             lastEventRetryTime = now;
             stateChangeCount++;
@@ -468,7 +546,8 @@ void loop() {
             updateVisualIndicator(currentCoilState);
             Serial.printf("[%7lu ms] Absence detection disabled during FAULT -> %s\n",
                 (unsigned long)now, getCoilStateString(currentCoilState));
-            stateEventPending  = !syncCurrentStateEvent();
+            stateEventPending  = !syncCurrentStateEvent(true);
+            if (stateEventPending) eventFailedThisPass = true;
         }
     }
 
@@ -511,7 +590,8 @@ void loop() {
 
                     updateVisualIndicator(currentCoilState);
                     Serial.printf("[%7lu ms] State change: %s\n", (unsigned long)now, getCoilStateString(currentCoilState));
-                    stateEventPending  = !syncCurrentStateEvent();
+                    stateEventPending  = !syncCurrentStateEvent(true);
+                    if (stateEventPending) eventFailedThisPass = true;
                 }
             } else {
                 if (currentCoilState == COIL_RECOVERING) {
@@ -542,7 +622,8 @@ void loop() {
 
                     updateVisualIndicator(currentCoilState);
                     Serial.printf("[%7lu ms] State change: %s\n", (unsigned long)now, getCoilStateString(currentCoilState));
-                    stateEventPending  = !syncCurrentStateEvent();
+                    stateEventPending  = !syncCurrentStateEvent(true);
+                    if (stateEventPending) eventFailedThisPass = true;
                 }
             }
         }
@@ -556,7 +637,8 @@ void loop() {
         if (!stateEventPending && (now - lastPulseSentTime >= MIN_PULSE_INTERVAL_MS)) {
             lastPulseSentTime  = now;
             lastEventRetryTime = now;
-            stateEventPending  = !syncCurrentStateEvent();
+            stateEventPending  = !syncCurrentStateEvent(true);
+            if (stateEventPending) eventFailedThisPass = true;
         }
     }
 
@@ -578,7 +660,8 @@ void loop() {
             (unsigned long)(now - recoveryStartTime),
             (unsigned long)recoveryLimitMs,
             getCoilStateString(currentCoilState));
-        stateEventPending  = !syncCurrentStateEvent();
+        stateEventPending  = !syncCurrentStateEvent(true);
+        if (stateEventPending) eventFailedThisPass = true;
     }
 
     // ── Trigger Limit Escalation (IDLE -> FAULT past trigger limit) ─────────
@@ -597,23 +680,28 @@ void loop() {
             (unsigned long)(now - absenceStartTime),
             (unsigned long)triggerLimitMs,
             getCoilStateString(currentCoilState));
-        stateEventPending  = !syncCurrentStateEvent();
+        stateEventPending  = !syncCurrentStateEvent(true);
+        if (stateEventPending) eventFailedThisPass = true;
     }
 
     // ── Retry Failed State Event POST ───────────────────────────────────────
-    if (stateEventPending && (now - lastEventRetryTime >= EVENT_RETRY_INTERVAL_MS)) {
+    if (stateEventPending && !eventFailedThisPass && (now - lastEventRetryTime >= EVENT_RETRY_INTERVAL_MS)) {
         lastEventRetryTime = now;
-        stateEventPending  = !syncCurrentStateEvent();
+        stateEventPending  = !syncCurrentStateEvent(false);
+        if (stateEventPending) eventFailedThisPass = true;
     }
 
     // ── Background Heartbeat ────────────────────────────────────────────────
     if (now - lastHeartbeatTime >= HEARTBEAT_INTERVAL_MS) {
         lastHeartbeatTime = now;
-        if (stateEventPending) {
+        if (stateEventPending && !eventFailedThisPass) {
             lastEventRetryTime = now;
-            stateEventPending  = !syncCurrentStateEvent();
+            stateEventPending  = !syncCurrentStateEvent(false);
+            if (stateEventPending) eventFailedThisPass = true;
         }
-        sendHeartbeat();
+        if (!eventFailedThisPass) {
+            sendHeartbeat();
+        }
     }
 
     // ── Periodic Serial Status Log ──────────────────────────────────────────
